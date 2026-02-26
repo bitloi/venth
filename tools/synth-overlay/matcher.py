@@ -1,0 +1,53 @@
+"""Map Polymarket URL/slug to Synth market type and supported asset."""
+
+import re
+from typing import Literal
+
+MARKET_DAILY = "daily"
+MARKET_HOURLY = "hourly"
+MARKET_RANGE = "range"
+
+# Slugs in mock data; real API would return data for the requested market.
+MOCK_DAILY_SLUG = "bitcoin-up-or-down-on-february-26"
+MOCK_HOURLY_SLUG = "bitcoin-up-or-down-february-25-6pm-et"
+MOCK_RANGE_SLUG_PREFIX = "bitcoin-price-on-"
+
+
+def normalize_slug(url_or_slug: str) -> str | None:
+    """Extract market slug from Polymarket URL or return slug as-is if already a slug."""
+    if not url_or_slug or not isinstance(url_or_slug, str):
+        return None
+    s = url_or_slug.strip()
+    # polymarket.com/event/... or .../market/slug
+    m = re.search(r"polymarket\.com/(?:event/|market/)?([a-zA-Z0-9-]+)", s)
+    if m:
+        return m.group(1)
+    # Already slug-like (alphanumeric and hyphens)
+    if re.match(r"^[a-zA-Z0-9-]+$", s):
+        return s
+    return None
+
+
+def get_market_type(slug: str) -> Literal["daily", "hourly", "range"] | None:
+    """Infer Synth market type from slug. Returns None if not recognizable."""
+    if not slug:
+        return None
+    slug_lower = slug.lower()
+    if "up-or-down" in slug_lower and "6pm" in slug_lower:
+        return MARKET_HOURLY
+    if "up-or-down" in slug_lower and ("on-" in slug_lower or "february" in slug_lower):
+        return MARKET_DAILY
+    if "price-on" in slug_lower or "price-on-" in slug_lower:
+        return MARKET_RANGE
+    if slug_lower == MOCK_DAILY_SLUG:
+        return MARKET_DAILY
+    if slug_lower == MOCK_HOURLY_SLUG:
+        return MARKET_HOURLY
+    if MOCK_RANGE_SLUG_PREFIX in slug_lower:
+        return MARKET_RANGE
+    return None
+
+
+def is_supported(slug: str) -> bool:
+    """True if slug maps to a Synth-supported market (daily, hourly, or range)."""
+    return get_market_type(slug) is not None

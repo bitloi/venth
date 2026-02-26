@@ -1,0 +1,60 @@
+.synth-overlay-root {
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 12px;
+  z-index: 9999;
+}
+
+.synth-overlay-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  margin: 4px 0;
+}
+
+.synth-overlay-underpriced {
+  background: rgba(0, 128, 0, 0.15);
+  color: #0a6b0a;
+  border: 1px solid rgba(0, 128, 0, 0.4);
+}
+
+.synth-overlay-overpriced {
+  background: rgba(180, 0, 0, 0.12);
+  color: #b00;
+  border: 1px solid rgba(180, 0, 0, 0.4);
+}
+
+.synth-overlay-fair {
+  background: rgba(100, 100, 100, 0.12);
+  color: #444;
+  border: 1px solid rgba(100, 100, 100, 0.3);
+}
+
+.synth-overlay-strength {
+  font-size: 10px;
+  text-transform: uppercase;
+  opacity: 0.85;
+}
+
+.synth-overlay-detail {
+  padding: 8px 12px;
+  margin-top: 4px;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  border: 1px solid #e0e0e0;
+  max-width: 280px;
+}
+
+.synth-overlay-detail-row {
+  margin-bottom: 4px;
+}
+
+.synth-overlay-detail-meta {
+  margin-top: 6px;
+  font-size: 10px;
+  color: #888;
+}
