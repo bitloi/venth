@@ -115,7 +115,13 @@ def edge():
                 brackets,
                 key=lambda b: float(b.get("polymarket_probability") or 0),
             )
-        edge_pct, signal, strength = edge_from_range_bracket(selected)
+        pct_24h = None
+        try:
+            pct_24h = client.get_prediction_percentiles("BTC", horizon="24h")
+        except Exception:
+            pass
+        analyzer = EdgeAnalyzer()
+        result = analyzer.analyze_range(selected, brackets, pct_24h)
         bracket_edges = []
         for bracket in brackets:
             b_edge, b_signal, b_strength = edge_from_range_bracket(bracket)
@@ -133,10 +139,13 @@ def edge():
             "slug": selected.get("slug"),
             "horizon": "24h",
             "bracket_title": selected.get("title"),
-            "edge_pct": edge_pct,
-            "signal": signal,
-            "strength": strength,
-            "no_trade_warning": strength == "none",
+            "edge_pct": result.primary.edge_pct,
+            "signal": result.primary.signal,
+            "strength": result.strength,
+            "confidence_score": result.confidence_score,
+            "no_trade_warning": result.no_trade,
+            "explanation": result.explanation,
+            "invalidation": result.invalidation,
             "synth_probability": selected.get("synth_probability"),
             "polymarket_probability": selected.get("polymarket_probability"),
             "current_time": selected.get("current_time"),

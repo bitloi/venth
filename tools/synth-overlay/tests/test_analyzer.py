@@ -131,3 +131,57 @@ class TestExplanations:
         pct = _pct(100, 98, 105, 112)
         r = EdgeAnalyzer(_daily(0.55, 0.50), _daily(0.54, 0.50), pct, pct).analyze()
         assert "bias" in r.invalidation.lower()
+
+
+def _bracket(title, synth_prob, market_prob):
+    return {
+        "slug": "bitcoin-price-on-february-26",
+        "title": title,
+        "synth_probability": synth_prob,
+        "polymarket_probability": market_prob,
+        "current_time": "2026-02-25T23:45:00+00:00",
+    }
+
+
+class TestRangeAnalysis:
+    def test_analyze_range_returns_result(self):
+        sel = _bracket("[66000, 68000]", 0.38, 0.40)
+        r = EdgeAnalyzer().analyze_range(sel, [sel])
+        assert isinstance(r, AnalysisResult)
+        assert r.primary.horizon == "24h"
+        assert r.secondary is None
+
+    def test_range_underpriced(self):
+        sel = _bracket("[68000, 70000]", 0.34, 0.32)
+        r = EdgeAnalyzer().analyze_range(sel, [sel])
+        assert r.primary.signal == "underpriced"
+        assert "higher" in r.explanation.lower()
+
+    def test_range_overpriced(self):
+        sel = _bracket("[66000, 68000]", 0.35, 0.40)
+        r = EdgeAnalyzer().analyze_range(sel, [sel])
+        assert r.primary.signal == "overpriced"
+        assert "lower" in r.explanation.lower()
+
+    def test_range_fair(self):
+        sel = _bracket("[66000, 68000]", 0.40, 0.40)
+        r = EdgeAnalyzer().analyze_range(sel, [sel])
+        assert r.primary.signal == "fair"
+        assert "agree" in r.explanation.lower()
+
+    def test_range_has_explanation_and_invalidation(self):
+        sel = _bracket("[68000, 70000]", 0.34, 0.32)
+        r = EdgeAnalyzer().analyze_range(sel, [sel])
+        assert len(r.explanation) > 10
+        assert len(r.invalidation) > 10
+
+    def test_range_confidence_with_percentiles(self):
+        sel = _bracket("[66000, 68000]", 0.38, 0.40)
+        pct = _pct(67000, 66500, 67000, 67500)
+        r = EdgeAnalyzer().analyze_range(sel, [sel], pct)
+        assert r.confidence_score >= 0.7
+
+    def test_range_no_trade_on_weak_edge(self):
+        sel = _bracket("[66000, 68000]", 0.40, 0.40)
+        r = EdgeAnalyzer().analyze_range(sel, [sel])
+        assert r.no_trade is True

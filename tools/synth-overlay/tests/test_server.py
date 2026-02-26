@@ -85,6 +85,12 @@ def test_edge_range(client):
     assert "range_brackets" in data
     assert isinstance(data["range_brackets"], list)
     assert len(data["range_brackets"]) > 1
+    assert "confidence_score" in data
+    assert 0 <= data["confidence_score"] <= 1
+    assert "explanation" in data
+    assert len(data["explanation"]) > 10
+    assert "invalidation" in data
+    assert len(data["invalidation"]) > 10
 
 
 def test_edge_range_respects_bracket_title(client):

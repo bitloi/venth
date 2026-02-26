@@ -9,6 +9,7 @@ from typing import Literal
 from edge import (
     compute_edge_pct,
     signal_from_edge,
+    strength_from_edge,
     signals_conflict,
     strength_from_horizons,
 )
@@ -17,6 +18,15 @@ from edge import (
 @dataclass
 class HorizonEdge:
     horizon: str
+    edge_pct: float
+    signal: str
+    synth_prob: float
+    market_prob: float
+
+
+@dataclass
+class BracketEdge:
+    title: str
     edge_pct: float
     signal: str
     synth_prob: float
@@ -153,6 +163,98 @@ class EdgeAnalyzer:
             direction = "upward" if bias_24h > 0 else "downward"
             parts.append(f"Synth median shows a {direction} bias of {abs(bias_24h)*100:.1f}%.")
         return " ".join(parts)
+
+    def analyze_range(
+        self,
+        selected_bracket: dict,
+        all_brackets: list[dict],
+        percentiles_24h: dict | None = None,
+    ) -> AnalysisResult:
+        """Analyze a range market bracket with context from all brackets."""
+        synth = float(selected_bracket.get("synth_probability", 0))
+        market = float(selected_bracket.get("polymarket_probability", 0))
+        edge_pct = compute_edge_pct(synth, market)
+        signal = signal_from_edge(edge_pct)
+        strength = strength_from_edge(edge_pct)
+        title = selected_bracket.get("title", "")
+
+        spread_24h = self._percentile_spread(percentiles_24h)
+        confidence = self.compute_confidence(None, spread_24h)
+        high_uncertainty = spread_24h is not None and spread_24h > 0.05
+        no_trade = strength == "none" or high_uncertainty
+
+        mispriced = [
+            b for b in all_brackets
+            if abs(float(b.get("synth_probability", 0)) - float(b.get("polymarket_probability", 0))) > 0.005
+        ]
+        explanation = self._build_range_explanation(
+            title, edge_pct, signal, mispriced, confidence
+        )
+        invalidation = self._build_range_invalidation(
+            selected_bracket, signal
+        )
+
+        primary = HorizonEdge(
+            horizon="24h",
+            edge_pct=edge_pct,
+            signal=signal,
+            synth_prob=synth,
+            market_prob=market,
+        )
+        return AnalysisResult(
+            primary=primary,
+            secondary=None,
+            strength=strength,
+            confidence_score=confidence,
+            no_trade=no_trade,
+            explanation=explanation,
+            invalidation=invalidation,
+        )
+
+    def _build_range_explanation(
+        self,
+        title: str,
+        edge_pct: float,
+        signal: str,
+        mispriced_brackets: list[dict],
+        confidence: float,
+    ) -> str:
+        parts = []
+        if signal == "fair":
+            parts.append(
+                f"Bracket {title}: Synth and Polymarket agree closely "
+                f"(edge {edge_pct:+.1f}pp)."
+            )
+        else:
+            direction = "higher" if edge_pct > 0 else "lower"
+            parts.append(
+                f"Bracket {title}: Synth assigns {direction} probability "
+                f"than Polymarket by {abs(edge_pct):.1f}pp."
+            )
+        if len(mispriced_brackets) > 1:
+            parts.append(
+                f"{len(mispriced_brackets)} of {len(mispriced_brackets)} "
+                f"brackets show mispricing."
+            )
+        if confidence >= 0.7:
+            parts.append("Forecast distribution is narrow — high confidence.")
+        elif confidence <= 0.3:
+            parts.append("Forecast distribution is wide — low confidence, treat with caution.")
+        return " ".join(parts)
+
+    def _build_range_invalidation(self, bracket: dict, signal: str) -> str:
+        title = bracket.get("title", "")
+        if signal == "underpriced":
+            return (
+                f"Edge on {title} invalidates if price moves away from this range, "
+                f"reducing the probability of landing here."
+            )
+        if signal == "overpriced":
+            return (
+                f"Edge on {title} invalidates if price moves toward this range, "
+                f"increasing the probability of landing here."
+            )
+        return f"No meaningful edge on {title} — bracket is fairly priced."
 
     def analyze(self, primary_horizon: str = "24h") -> AnalysisResult:
         if not self._daily or not self._hourly:

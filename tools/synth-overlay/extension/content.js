@@ -216,13 +216,15 @@
       removeBadge();
       return;
     }
+    var requestedSlug = slug;
     fetchEdge(slug).then(function (data) {
+      if (slugFromPage() !== requestedSlug) return;
       if (!data || data.error) {
         currentSlug = null;
         removeBadge();
         return;
       }
-      currentSlug = slug;
+      currentSlug = requestedSlug;
       var target = findInjectionTarget();
       if (target) injectBadge(target, data);
     });

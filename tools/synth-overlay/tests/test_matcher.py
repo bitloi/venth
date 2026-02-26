@@ -29,6 +29,8 @@ def test_get_market_type_daily():
 
 def test_get_market_type_hourly():
     assert get_market_type("bitcoin-up-or-down-february-25-6pm-et") == "hourly"
+    assert get_market_type("bitcoin-up-or-down-february-26-10am-et") == "hourly"
+    assert get_market_type("btc-up-or-down-march-1-3pm-et") == "hourly"
 
 
 def test_get_market_type_range():
