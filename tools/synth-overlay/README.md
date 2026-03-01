@@ -1,22 +1,22 @@
 # Synth Overlay — Polymarket Edge Extension
 
-Chrome extension that adds a live "fair value" layer on Polymarket market pages using Synth forecasts. Shows whether the current YES price is **underpriced**, **overpriced**, or **fair** and exposes edge strength (Strong / Moderate / No Edge).
+Chrome extension that uses Chrome's **native Side Panel** to show Synth market context on Polymarket. The panel is data-first: Synth Up/Down prices, edge, confidence, signal explanation, and invalidation conditions.
 
 ## What it does
 
-- **Side panel**: A "Synth" tab on the right edge opens a slide-out panel with full analysis, refresh button, and last-update timestamp.
-- **Synth prices on buttons**: Synth forecast prices (`Synth: xx¢`) appear directly below the Up/Down outcome buttons so users see the fair value at a glance.
-- **Live market prices from DOM**: Market prices shown in the panel are read directly from Polymarket's page elements (not cached API data), so they always match what the user sees.
-- **Confidence bar**: Discrete colors — red (&lt;40%), amber (40–70%), green (≥70%). 45% confidence is never green.
-- **Manual refresh**: Panel footer has a refresh button to re-fetch Synth data and re-read DOM prices on demand.
-- **Contextual only**: Overlay appears only when the page slug maps to a Synth-supported market (daily up/down, hourly up/down, or range). Unsupported markets show nothing.
+- **Native Side Panel**: Uses Chrome Side Panel API (`chrome.sidePanel`) instead of an in-page floating overlay.
+- **Data-focused UI**: Shows Synth Up/Down prices, YES edge, confidence, explanation, and what would invalidate the signal.
+- **Synth-sourced prices only**: Displays prices from the Synth API to avoid sync issues with DOM-scraped market data.
+- **Manual + auto refresh**: Refresh button in panel plus automatic 15s refresh. "Data as of" timestamp shows when the Synth data was generated.
+- **Clear confidence colors**: red (&lt;40%), amber (40–70%), green (≥70%).
+- **Contextual only**: Enabled on Polymarket pages; panel shows guidance when page/slug is unsupported.
 
 ## How it works
 
-1. **Extension** (content script on `polymarket.com`) reads the page URL and extracts the market slug.
-2. **Local API** (Flask on `http://127.0.0.1:8765`) is called with `GET /api/edge?slug=...`. The server uses `SynthClient` (mock or live) to load Polymarket comparison data.
-3. **Edge logic** computes `edge_pct = (synth_prob - market_prob) * 100` and classifies signal (underpriced / fair / overpriced) and strength (strong / moderate / none) from thresholds.
-4. **Overlay** is injected only when the API returns 200; 404 (unsupported market) keeps the page unchanged.
+1. **Content script** (on `polymarket.com`) reads the market slug from the page URL.
+2. **Side panel page** requests context from the content script and fetches Synth edge data from local API (`GET /api/edge?slug=...`).
+3. **Panel rendering** displays Synth forecast data (prices, edge, signal, confidence, analysis, invalidation) and updates every 15s or on manual refresh.
+4. **Background service worker** enables/disables side panel per-tab based on URL.
 
 ## Synth API usage
 
@@ -30,9 +30,9 @@ Chrome extension that adds a live "fair value" layer on Polymarket market pages 
 1. Install: `pip install -r requirements.txt` (from repo root: `pip install -r tools/synth-overlay/requirements.txt`).
 2. Start server (from repo root): `python tools/synth-overlay/server.py` (or from `tools/synth-overlay`: `python server.py`). Listens on `127.0.0.1:8765`.
 3. Load extension: Chrome → Extensions → Load unpacked → select `tools/synth-overlay/extension`.
-4. Open a Polymarket event/market URL whose slug matches a supported market (e.g. `bitcoin-up-or-down-on-february-26` for mock daily). The Synth tab appears when the server is running and the slug is supported.
+4. Click the extension icon to open **Chrome Side Panel** (or pin and open from Side Panel UI). On Polymarket pages, the panel auto-enables.
 
-## Verify the overlay (before recording)
+## Verify the side panel (before recording)
 
 1. **Check the API** (server must be running):
    ```bash
@@ -43,12 +43,12 @@ Chrome extension that adds a live "fair value" layer on Polymarket market pages 
 2. **Open the exact URL** in Chrome (with the extension loaded from `extension/`):
    - Daily (mock): `https://polymarket.com/event/bitcoin-up-or-down-on-february-26`
    - Hourly (mock): `https://polymarket.com/event/bitcoin-up-or-down-february-25-6pm-et`
-   - The extension reads the slug from the path and calls the API. If the API returned 200 in step 1, the **Synth tab** appears on the right edge and **inline overlays** may appear on Up/Down buttons.
+   - The side panel requests the slug from the page and fetches Synth data from the local API. If API returns 200, panel fields populate.
 
 3. **Interaction:**
-   - **Synth tab** = vertical tab on the right edge. Click it to open the **side panel**.
-   - **Side panel** shows: Synth forecast (Up/Down prices, edge), live market prices (read from DOM), Signal (1h/24h), Confidence (color-coded bar), invalidation, and a refresh button.
-   - **Synth prices** appear directly below Up/Down buttons (`Synth: xx¢`) so users see the forecast where they act.
+   - Click the extension icon (or open Chrome Side Panel UI) to open the **native side panel**.
+   - Panel shows: Synth Up/Down prices, edge, signal, confidence, analysis, invalidation, and data timestamp.
+   - Use **↻ Refresh** for immediate sync; panel auto-refreshes every 15 seconds.
 
 4. **If nothing appears:** Ensure (a) server is running, (b) you loaded the extension from `tools/synth-overlay/extension` (not the parent folder), (c) the address bar is exactly one of the supported URLs above. Open DevTools → Network: you should see a request to `127.0.0.1:8765/api/edge?slug=...` with status 200.
 
