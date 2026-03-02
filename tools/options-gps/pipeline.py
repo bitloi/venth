@@ -4,12 +4,21 @@ payoff/probability engine, ranking, and guardrails.
 Uses Synth get_prediction_percentiles, get_option_pricing, get_volatility.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 ViewBias = Literal["bullish", "bearish", "neutral"]
 RiskLevel = Literal["low", "medium", "high"]
 FusionState = Literal["aligned_bullish", "aligned_bearish", "countermove", "unclear"]
+
+
+@dataclass
+class StrategyLeg:
+    action: str          # "BUY" or "SELL"
+    quantity: int
+    option_type: str     # "Call" or "Put"
+    strike: float
+    premium: float
 
 
 @dataclass
@@ -20,6 +29,10 @@ class StrategyCandidate:
     strikes: list[float]
     cost: float
     max_loss: float
+    legs: list[StrategyLeg] = field(default_factory=list)
+    expiry: str = ""
+    max_profit: float = 0.0
+    max_profit_condition: str = ""
 
 
 @dataclass
@@ -80,6 +93,8 @@ def generate_strategies(
     option_data: dict,
     view: ViewBias,
     risk: RiskLevel,
+    asset: str = "BTC",
+    expiry: str = "",
 ) -> list[StrategyCandidate]:
     """Build candidate strategies from option pricing and user view/risk."""
     current = float(option_data.get("current_price", 0))
@@ -95,53 +110,96 @@ def generate_strategies(
     idx_atm = strikes.index(atm)
     otm_call = strikes[min(idx_atm + 2, len(strikes) - 1)] if idx_atm + 2 < len(strikes) else strikes[-1]
     otm_put = strikes[max(idx_atm - 2, 0)] if idx_atm >= 2 else strikes[0]
+
+    def _long_call(strike, label):
+        prem = float(calls[strike])
+        be = strike + prem
+        return StrategyCandidate(
+            "long_call", "bullish", label, [strike], prem, prem,
+            legs=[StrategyLeg("BUY", 1, "Call", strike, prem)],
+            expiry=expiry,
+            max_profit_condition=f"Unlimited upside if {asset} > ${be:,.0f} (breakeven)",
+        )
+
+    def _long_put(strike, label):
+        prem = float(puts[strike])
+        be = strike - prem
+        return StrategyCandidate(
+            "long_put", "bearish", label, [strike], prem, prem,
+            legs=[StrategyLeg("BUY", 1, "Put", strike, prem)],
+            expiry=expiry,
+            max_profit_condition=f"Max profit if {asset} falls well below ${be:,.0f} (breakeven)",
+        )
+
     if view == "bullish":
         if atm in calls:
-            candidates.append(StrategyCandidate(
-                "long_call", "bullish", "Long call (ATM)", [atm], float(calls[atm]), float(calls[atm])
-            ))
+            candidates.append(_long_call(atm, "Long call (ATM)"))
         if otm_call in calls and otm_call != atm:
-            candidates.append(StrategyCandidate(
-                "long_call", "bullish", "Long call (OTM)", [otm_call], float(calls[otm_call]), float(calls[otm_call])
-            ))
+            candidates.append(_long_call(otm_call, "Long call (OTM)"))
         if atm in calls and otm_call in calls:
-            debit = float(calls[atm]) - float(calls[otm_call])
+            prem_buy = float(calls[atm])
+            prem_sell = float(calls[otm_call])
+            debit = prem_buy - prem_sell
             if debit > 0:
+                width = otm_call - atm
+                mp = width - debit
                 candidates.append(StrategyCandidate(
-                    "call_debit_spread", "bullish", "Call debit spread", [atm, otm_call], debit, debit
+                    "call_debit_spread", "bullish", "Call debit spread", [atm, otm_call], debit, debit,
+                    legs=[StrategyLeg("BUY", 1, "Call", atm, prem_buy),
+                          StrategyLeg("SELL", 1, "Call", otm_call, prem_sell)],
+                    expiry=expiry, max_profit=mp,
+                    max_profit_condition=f"${mp:,.0f} if {asset} >= ${otm_call:,.0f} at expiry",
                 ))
         put_short = atm
         put_long = strikes[max(0, idx_atm - 1)]
         if put_short in puts and put_long in puts and put_short > put_long:
-            credit = float(puts[put_short]) - float(puts[put_long])
+            prem_sell = float(puts[put_short])
+            prem_buy = float(puts[put_long])
+            credit = prem_sell - prem_buy
             width = put_short - put_long
             if credit > 0:
                 candidates.append(StrategyCandidate(
-                    "bull_put_credit_spread", "bullish", "Bull put credit spread", [put_long, put_short], -credit, width - credit
+                    "bull_put_credit_spread", "bullish", "Bull put credit spread",
+                    [put_long, put_short], -credit, width - credit,
+                    legs=[StrategyLeg("SELL", 1, "Put", put_short, prem_sell),
+                          StrategyLeg("BUY", 1, "Put", put_long, prem_buy)],
+                    expiry=expiry, max_profit=credit,
+                    max_profit_condition=f"${credit:,.0f} credit kept if {asset} >= ${put_short:,.0f} at expiry",
                 ))
     if view == "bearish":
         if atm in puts:
-            candidates.append(StrategyCandidate(
-                "long_put", "bearish", "Long put (ATM)", [atm], float(puts[atm]), float(puts[atm])
-            ))
+            candidates.append(_long_put(atm, "Long put (ATM)"))
         if otm_put in puts and otm_put != atm:
-            candidates.append(StrategyCandidate(
-                "long_put", "bearish", "Long put (OTM)", [otm_put], float(puts[otm_put]), float(puts[otm_put])
-            ))
+            candidates.append(_long_put(otm_put, "Long put (OTM)"))
         if atm in puts and otm_put in puts:
-            debit = float(puts[atm]) - float(puts[otm_put])
+            prem_buy = float(puts[atm])
+            prem_sell = float(puts[otm_put])
+            debit = prem_buy - prem_sell
             if debit > 0:
+                width = atm - otm_put
+                mp = width - debit
                 candidates.append(StrategyCandidate(
-                    "put_debit_spread", "bearish", "Put debit spread", [otm_put, atm], debit, debit
+                    "put_debit_spread", "bearish", "Put debit spread", [otm_put, atm], debit, debit,
+                    legs=[StrategyLeg("BUY", 1, "Put", atm, prem_buy),
+                          StrategyLeg("SELL", 1, "Put", otm_put, prem_sell)],
+                    expiry=expiry, max_profit=mp,
+                    max_profit_condition=f"${mp:,.0f} if {asset} <= ${otm_put:,.0f} at expiry",
                 ))
         call_short = atm
         call_long = strikes[min(len(strikes) - 1, idx_atm + 1)]
         if call_short in calls and call_long in calls and call_long > call_short:
-            credit = float(calls[call_short]) - float(calls[call_long])
+            prem_sell = float(calls[call_short])
+            prem_buy = float(calls[call_long])
+            credit = prem_sell - prem_buy
             width = call_long - call_short
             if credit > 0:
                 candidates.append(StrategyCandidate(
-                    "bear_call_credit_spread", "bearish", "Bear call credit spread", [call_short, call_long], -credit, width - credit
+                    "bear_call_credit_spread", "bearish", "Bear call credit spread",
+                    [call_short, call_long], -credit, width - credit,
+                    legs=[StrategyLeg("SELL", 1, "Call", call_short, prem_sell),
+                          StrategyLeg("BUY", 1, "Call", call_long, prem_buy)],
+                    expiry=expiry, max_profit=credit,
+                    max_profit_condition=f"${credit:,.0f} credit kept if {asset} <= ${call_short:,.0f} at expiry",
                 ))
     if view == "neutral" or (view == "bullish" and risk == "low") or (view == "bearish" and risk == "low"):
         low_put = strikes[max(0, idx_atm - 3)]
@@ -149,49 +207,132 @@ def generate_strategies(
         put_short = strikes[max(0, idx_atm - 1)]
         call_short = strikes[min(len(strikes) - 1, idx_atm + 1)]
         if low_put in puts and high_call in calls and put_short in puts and call_short in calls and low_put < current < high_call:
-            credit_put = float(puts[put_short]) - float(puts[low_put])
-            credit_call = float(calls[call_short]) - float(calls[high_call])
+            prem_ps = float(puts[put_short])
+            prem_pl = float(puts[low_put])
+            prem_cs = float(calls[call_short])
+            prem_ch = float(calls[high_call])
+            credit_put = prem_ps - prem_pl
+            credit_call = prem_cs - prem_ch
             credit = credit_put + credit_call
             if credit > 0:
                 max_width = max(put_short - low_put, high_call - call_short)
                 max_loss = max_width - credit
                 candidates.append(StrategyCandidate(
-                    "iron_condor", "neutral", "Iron condor (defined risk)", [put_short, call_short],
-                    -credit, max_loss
+                    "iron_condor", "neutral", "Iron condor (defined risk)",
+                    [put_short, call_short], -credit, max_loss,
+                    legs=[StrategyLeg("BUY", 1, "Put", low_put, prem_pl),
+                          StrategyLeg("SELL", 1, "Put", put_short, prem_ps),
+                          StrategyLeg("SELL", 1, "Call", call_short, prem_cs),
+                          StrategyLeg("BUY", 1, "Call", high_call, prem_ch)],
+                    expiry=expiry, max_profit=credit,
+                    max_profit_condition=f"${credit:,.0f} if {asset} between ${put_short:,.0f}-${call_short:,.0f} at expiry",
                 ))
     if view == "neutral":
         lower = strikes[max(0, idx_atm - 2)]
         upper = strikes[min(len(strikes) - 1, idx_atm + 2)]
         if lower in calls and atm in calls and upper in calls and lower < atm < upper:
-            cost = float(calls[lower]) - 2 * float(calls[atm]) + float(calls[upper])
+            prem_lo = float(calls[lower])
+            prem_atm = float(calls[atm])
+            prem_up = float(calls[upper])
+            cost = prem_lo - 2 * prem_atm + prem_up
             if cost > 0:
+                mp = (atm - lower) - cost
                 candidates.append(StrategyCandidate(
-                    "long_call_butterfly", "neutral", "Long call butterfly", [lower, atm, upper], cost, cost
+                    "long_call_butterfly", "neutral", "Long call butterfly",
+                    [lower, atm, upper], cost, cost,
+                    legs=[StrategyLeg("BUY", 1, "Call", lower, prem_lo),
+                          StrategyLeg("SELL", 2, "Call", atm, prem_atm),
+                          StrategyLeg("BUY", 1, "Call", upper, prem_up)],
+                    expiry=expiry, max_profit=mp,
+                    max_profit_condition=f"${mp:,.0f} if {asset} at ${atm:,.0f} at expiry",
                 ))
         if atm in calls:
-            candidates.append(StrategyCandidate(
-                "long_call", "bullish", "Long call (ATM)", [atm], float(calls[atm]), float(calls[atm])
-            ))
+            candidates.append(_long_call(atm, "Long call (ATM)"))
         if atm in puts:
-            candidates.append(StrategyCandidate(
-                "long_put", "bearish", "Long put (ATM)", [atm], float(puts[atm]), float(puts[atm])
-            ))
+            candidates.append(_long_put(atm, "Long put (ATM)"))
     if not candidates and view == "neutral":
         if atm in calls:
-            candidates.append(StrategyCandidate("long_call", "bullish", "Long call (ATM)", [atm], float(calls[atm]), float(calls[atm])))
+            candidates.append(_long_call(atm, "Long call (ATM)"))
         if atm in puts:
-            candidates.append(StrategyCandidate("long_put", "bearish", "Long put (ATM)", [atm], float(puts[atm]), float(puts[atm])))
+            candidates.append(_long_put(atm, "Long put (ATM)"))
     return candidates
+
+
+PERCENTILE_KEYS = ["0.05", "0.2", "0.35", "0.5", "0.65", "0.8", "0.95"]
+PERCENTILE_CDF = [float(k) for k in PERCENTILE_KEYS]  # [0.05, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95]
+PERCENTILE_LABELS = {"0.05": "5%", "0.2": "20%", "0.35": "35%", "0.5": "50%", "0.65": "65%", "0.8": "80%", "0.95": "95%"}
 
 
 def _outcome_prices(percentiles_last: dict) -> list[float]:
     """Ordered outcome prices from percentile dict (e.g. 0.05, 0.2, ..., 0.95)."""
-    keys = ["0.05", "0.2", "0.35", "0.5", "0.65", "0.8", "0.95"]
     out = []
-    for k in keys:
+    for k in PERCENTILE_KEYS:
         if k in percentiles_last:
             out.append(float(percentiles_last[k]))
     return out if out else [float(percentiles_last.get("0.5", 0))]
+
+
+def _outcome_prices_with_probs(percentiles_last: dict) -> list[tuple[str, float]]:
+    """Return (probability_label, price) pairs for display."""
+    out = []
+    for k in PERCENTILE_KEYS:
+        if k in percentiles_last:
+            out.append((PERCENTILE_LABELS.get(k, k), float(percentiles_last[k])))
+    return out if out else [("50%", float(percentiles_last.get("0.5", 0)))]
+
+
+def _percentile_weights(cdf_values: list[float]) -> list[float]:
+    """Probability mass each percentile point represents (midpoint rule).
+    E.g. for CDF [0.05, 0.20, ...] the 5th-pctl point covers [0, 0.125] = weight 0.125."""
+    n = len(cdf_values)
+    weights: list[float] = []
+    for i in range(n):
+        left = 0.0 if i == 0 else (cdf_values[i - 1] + cdf_values[i]) / 2
+        right = 1.0 if i == n - 1 else (cdf_values[i] + cdf_values[i + 1]) / 2
+        weights.append(right - left)
+    return weights
+
+
+def _interpolated_pop(pnl_values: list[float], cdf_values: list[float]) -> float:
+    """Probability of profit via CDF interpolation at zero-crossing points.
+    More accurate than counting discrete profitable outcomes."""
+    n = len(pnl_values)
+    if n == 0:
+        return 0.0
+    prob_positive = 0.0
+    # Left tail: [0, cdf[0]]
+    if pnl_values[0] > 0:
+        prob_positive += cdf_values[0]
+    # Between adjacent percentiles
+    for i in range(n - 1):
+        p1, p2 = pnl_values[i], pnl_values[i + 1]
+        c1, c2 = cdf_values[i], cdf_values[i + 1]
+        segment = c2 - c1
+        if p1 > 0 and p2 > 0:
+            prob_positive += segment
+        elif p1 <= 0 and p2 > 0:
+            frac = -p1 / (p2 - p1) if p2 != p1 else 0.5
+            prob_positive += segment * (1 - frac)
+        elif p1 > 0 and p2 <= 0:
+            frac = p1 / (p1 - p2) if p1 != p2 else 0.5
+            prob_positive += segment * frac
+    # Right tail: [cdf[-1], 1.0]
+    if pnl_values[-1] > 0:
+        prob_positive += 1.0 - cdf_values[-1]
+    return prob_positive
+
+
+def _outcome_prices_and_cdf(percentiles_last: dict) -> tuple[list[float], list[float]]:
+    """Return (prices, cdf_values) for matched percentile keys."""
+    prices: list[float] = []
+    cdf_vals: list[float] = []
+    for k in PERCENTILE_KEYS:
+        if k in percentiles_last:
+            prices.append(float(percentiles_last[k]))
+            cdf_vals.append(float(k))
+    if not prices:
+        return [float(percentiles_last.get("0.5", 0))], [0.5]
+    return prices, cdf_vals
 
 
 def _payoff_long_call(s: float, strike: float) -> float:
@@ -269,46 +410,73 @@ def _loss_profile(strategy: StrategyCandidate) -> str:
 
 def _risk_plan(strategy: StrategyCandidate) -> tuple[str, str, str]:
     st = strategy.strategy_type
+    k = strategy.strikes
+    cost = strategy.cost
+    exp = f" before {strategy.expiry}" if strategy.expiry else ""
     if st == "long_call":
+        be = k[0] + cost
         return (
-            "Invalidate if underlying closes below entry zone and option loses ~50% premium.",
-            "Convert to call spread or roll out in time if thesis remains.",
-            "Recheck in 1h and at 24h close."
+            f"Close if option value drops below ${cost * 0.5:,.0f} (50% of premium). Stop: price < ${k[0] * 0.97:,.0f}.",
+            f"Sell higher-strike call to convert into vertical spread. Or roll to next expiry if thesis holds.",
+            f"Breakeven: ${be:,.0f}. Review at 50% time-to-expiry{exp}."
         )
     if st == "long_put":
+        be = k[0] - cost
         return (
-            "Invalidate if underlying closes above entry zone and option loses ~50% premium.",
-            "Convert to put spread or roll out in time if thesis remains.",
-            "Recheck in 1h and at 24h close."
+            f"Close if option value drops below ${cost * 0.5:,.0f} (50% of premium). Stop: price > ${k[0] * 1.03:,.0f}.",
+            f"Sell lower-strike put to convert into vertical spread. Or roll to next expiry if thesis holds.",
+            f"Breakeven: ${be:,.0f}. Review at 50% time-to-expiry{exp}."
         )
-    if st in ("call_debit_spread", "put_debit_spread"):
+    if st == "call_debit_spread":
+        be = k[0] + cost
+        mp = (k[1] - k[0] - cost) if len(k) >= 2 else cost
         return (
-            "Invalidate if price moves through the short-strike side against thesis.",
-            "Roll strikes one step toward current price if conviction persists.",
-            "Recheck at 50% time-to-expiry."
+            f"Close if underlying drops through ${k[0]:,.0f} (long strike). Max loss: ${cost:,.0f} (debit paid).",
+            f"Buy back short ${k[1]:,.0f} call to go naked long if conviction rises. Close entire spread if weakens.",
+            f"Breakeven: ${be:,.0f}. Max profit: ${mp:,.0f} above ${k[1]:,.0f}. Review at 50% time-to-expiry."
         )
-    if st in ("bull_put_credit_spread", "bear_call_credit_spread"):
+    if st == "put_debit_spread":
+        be = k[1] - cost
+        mp = (k[1] - k[0] - cost) if len(k) >= 2 else cost
         return (
-            "Invalidate on short-strike breach with momentum against thesis.",
-            "Close tested side or roll tested spread further OTM.",
-            "Recheck each major price move (>1%)."
+            f"Close if underlying rallies through ${k[1]:,.0f} (long strike). Max loss: ${cost:,.0f} (debit paid).",
+            f"Buy back short ${k[0]:,.0f} put to go naked long if conviction rises. Close entire spread if weakens.",
+            f"Breakeven: ${be:,.0f}. Max profit: ${mp:,.0f} below ${k[0]:,.0f}. Review at 50% time-to-expiry."
+        )
+    if st == "bull_put_credit_spread":
+        credit = -cost
+        be = k[1] - credit
+        return (
+            f"Close if underlying drops below ${k[1]:,.0f} (short strike) with momentum. Max loss: ${strategy.max_loss:,.0f}.",
+            f"Roll short ${k[1]:,.0f} put down and out for additional credit. Or close tested side only.",
+            f"Breakeven: ${be:,.0f}. Keep full ${credit:,.0f} credit if above ${k[1]:,.0f} at expiry."
+        )
+    if st == "bear_call_credit_spread":
+        credit = -cost
+        be = k[0] + credit
+        return (
+            f"Close if underlying rallies above ${k[0]:,.0f} (short strike) with momentum. Max loss: ${strategy.max_loss:,.0f}.",
+            f"Roll short ${k[0]:,.0f} call up and out for additional credit. Or close tested side only.",
+            f"Breakeven: ${be:,.0f}. Keep full ${credit:,.0f} credit if below ${k[0]:,.0f} at expiry."
         )
     if st == "iron_condor":
+        credit = -cost
         return (
-            "Invalidate when either short strike is breached and trend continues.",
-            "Close tested wing and keep untested wing; or roll whole condor out.",
-            "Recheck every hour and at short-strike touch."
+            f"Close tested wing if underlying breaches ${k[0]:,.0f} (put side) or ${k[1]:,.0f} (call side).",
+            f"Close threatened wing for a loss; let untested wing expire worthless. Or roll entire condor out.",
+            f"Profit zone: ${k[0]:,.0f}-${k[1]:,.0f}. Max credit: ${credit:,.0f}. Review every hour."
         )
     if st == "long_call_butterfly":
+        mp = strategy.max_profit if strategy.max_profit > 0 else (k[1] - k[0] - cost if len(k) >= 3 else cost)
         return (
-            "Invalidate if expected pin near center strike no longer plausible.",
-            "Convert to directional debit spread toward observed drift.",
-            "Recheck near midpoint and 25% time-to-expiry."
+            f"Close if underlying moves far from ${k[1]:,.0f} center strike. Max loss: ${cost:,.0f} (debit paid).",
+            f"Convert to directional spread if price drifts. Sell wing closer to price for partial recovery.",
+            f"Max profit: ${mp:,.0f} at ${k[1]:,.0f}. Review near midpoint and at 25% time-to-expiry."
         )
     return (
-        "Invalidate on thesis break.",
-        "Use smaller risk structure if conviction remains.",
-        "Recheck every 1h."
+        "Close on thesis break.",
+        "Reduce to smaller defined-risk structure.",
+        "Review every 1h."
     )
 
 
@@ -341,14 +509,22 @@ def passes_hard_filters(strategy: StrategyCandidate, risk: RiskLevel, current_pr
 def compute_payoff_metrics(
     strategy: StrategyCandidate,
     outcome_prices: list[float],
+    cdf_values: list[float] | None = None,
 ) -> tuple[float, float]:
-    """Return (probability_of_profit, expected_value) for strategy under outcome distribution."""
+    """Return (probability_of_profit, expected_value) for strategy under outcome distribution.
+    When cdf_values are provided, uses proper probability weighting and CDF interpolation.
+    Otherwise falls back to equal-weight (for tests with arbitrary price lists)."""
     n = len(outcome_prices)
     if n == 0:
         return 0.0, 0.0
     pnl_values = strategy_pnl_values(strategy, outcome_prices)
-    ev = sum(pnl_values) / n
-    pop = sum(1 for x in pnl_values if x > 0) / n
+    if cdf_values and len(cdf_values) == n:
+        weights = _percentile_weights(cdf_values)
+        ev = sum(w * p for w, p in zip(weights, pnl_values))
+        pop = _interpolated_pop(pnl_values, cdf_values)
+    else:
+        ev = sum(pnl_values) / n
+        pop = sum(1 for x in pnl_values if x > 0) / n
     return pop, ev
 
 
@@ -368,16 +544,18 @@ def rank_strategies(
     current_price: float,
     confidence: float = 1.0,
     volatility_ratio: float = 1.0,
+    cdf_values: list[float] | None = None,
 ) -> list[ScoredStrategy]:
     """Score and sort strategies. Returns list of ScoredStrategy sorted by score desc.
     volatility_ratio = forecast_vol / realized_vol (1.0 = normal). When elevated,
-    defined-risk strategies get a bonus and naked/premium strategies get a penalty."""
+    defined-risk strategies get a bonus and naked/premium strategies get a penalty.
+    cdf_values enables probability-weighted PoP/EV when provided."""
     vol_elevated = volatility_ratio > 1.15
     scored: list[ScoredStrategy] = []
     for c in candidates:
         if not passes_hard_filters(c, risk, current_price):
             continue
-        pop, ev = compute_payoff_metrics(c, outcome_prices)
+        pop, ev = compute_payoff_metrics(c, outcome_prices, cdf_values)
         pnl_values = strategy_pnl_values(c, outcome_prices)
         tail_risk = _tail_risk_from_pnl(pnl_values)
         view_match = 1.0 if c.direction == view else (0.4 if c.direction == "neutral" else 0.1)

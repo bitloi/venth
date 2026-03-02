@@ -15,7 +15,13 @@ from pipeline import (
     should_no_trade,
     forecast_confidence,
     is_volatility_elevated,
+    _outcome_prices_with_probs,
+    _outcome_prices_and_cdf,
+    _percentile_weights,
+    _interpolated_pop,
+    PERCENTILE_CDF,
     StrategyCandidate,
+    StrategyLeg,
 )
 
 CURRENT = 67600.0
@@ -214,3 +220,183 @@ def test_vol_elevated_prefers_defined_risk():
     highvol_top = scored_highvol[0].strategy.strategy_type
     assert highvol_top == "call_debit_spread"
     assert "vol" in scored_highvol[0].rationale.lower()
+
+
+def test_generate_strategies_have_legs():
+    option_data = {
+        "current_price": 67723,
+        "call_options": {"67000": 1000, "67500": 640, "68000": 373, "68500": 197},
+        "put_options": {"67000": 140, "67500": 291, "68000": 526},
+        "expiry_time": "2026-02-26 08:00:00Z",
+    }
+    candidates = generate_strategies(option_data, "bullish", "medium", asset="BTC", expiry="2026-02-26 08:00:00Z")
+    for c in candidates:
+        assert len(c.legs) >= 1, f"{c.description} has no legs"
+        assert c.expiry == "2026-02-26 08:00:00Z"
+        for leg in c.legs:
+            assert leg.action in ("BUY", "SELL")
+            assert leg.option_type in ("Call", "Put")
+            assert leg.premium > 0
+            assert leg.strike > 0
+
+
+def test_generate_strategies_spread_has_two_legs():
+    option_data = {
+        "current_price": 67723,
+        "call_options": {"67000": 1000, "67500": 640, "68000": 373, "68500": 197},
+        "put_options": {"67000": 140, "67500": 291, "68000": 526},
+    }
+    candidates = generate_strategies(option_data, "bullish", "medium")
+    spreads = [c for c in candidates if "spread" in c.strategy_type]
+    for s in spreads:
+        assert len(s.legs) == 2, f"{s.description} should have 2 legs"
+        actions = {leg.action for leg in s.legs}
+        assert "BUY" in actions and "SELL" in actions
+        assert s.max_profit > 0
+        assert s.max_profit_condition
+
+
+def test_outcome_prices_with_probs():
+    pct = {"0.05": 64000, "0.2": 66000, "0.35": 67000, "0.5": 67500, "0.65": 68000, "0.8": 69000, "0.95": 72000}
+    result = _outcome_prices_with_probs(pct)
+    assert len(result) == 7
+    labels = [r[0] for r in result]
+    assert labels == ["5%", "20%", "35%", "50%", "65%", "80%", "95%"]
+    assert result[0][1] == 64000
+    assert result[-1][1] == 72000
+
+
+def test_risk_plan_has_specific_values():
+    strat = StrategyCandidate(
+        "long_call", "bullish", "Long call (ATM)", [68000], 400, 400,
+        legs=[StrategyLeg("BUY", 1, "Call", 68000, 400)],
+        expiry="2026-02-26",
+    )
+    from pipeline import _risk_plan
+    inv, reroute, review = _risk_plan(strat)
+    assert "$" in inv
+    assert "200" in inv  # 50% of $400
+    assert "68,400" in review  # breakeven = 68000 + 400
+    assert "2026-02-26" in review
+
+
+def test_parse_screen_arg():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from main import _parse_screen_arg
+    assert _parse_screen_arg("all") == {1, 2, 3, 4}
+    assert _parse_screen_arg("2,3") == {2, 3}
+    assert _parse_screen_arg("1") == {1}
+    assert _parse_screen_arg("") == {1, 2, 3, 4}  # invalid falls back to all
+    assert _parse_screen_arg("5") == {1, 2, 3, 4}  # out of range falls back
+
+
+def test_card_to_log_serializes_legs():
+    from pipeline import ScoredStrategy
+    from main import _card_to_log
+    strat = StrategyCandidate(
+        "long_call", "bullish", "Long call (ATM)", [68000], 400, 400,
+        legs=[StrategyLeg("BUY", 1, "Call", 68000, 400.50)],
+        expiry="2026-02-26", max_profit=0, max_profit_condition="Unlimited upside",
+    )
+    card = ScoredStrategy(strat, 0.5, 100.0, 400.0, "premium at risk",
+                          "close at 50%", "roll out", "review at 50%", 0.8, "Fit 100%")
+    log = _card_to_log(card)
+    assert log is not None
+    assert log["type"] == "long_call"
+    assert len(log["legs"]) == 1
+    assert log["legs"][0]["action"] == "BUY"
+    assert log["legs"][0]["strike"] == 68000
+    assert log["legs"][0]["premium"] == 400.50
+    assert log["net_cost"] == 400
+    assert log["expiry"] == "2026-02-26"
+    assert log["pop"] == 0.5
+    assert _card_to_log(None) is None
+
+
+def test_percentile_weights_sum_to_one():
+    weights = _percentile_weights(PERCENTILE_CDF)
+    assert abs(sum(weights) - 1.0) < 1e-9
+    assert abs(weights[0] - 0.125) < 1e-9  # [0, midpoint(0.05, 0.20)] = 0.125
+    assert abs(weights[3] - 0.15) < 1e-9   # middle bins = 0.15
+    assert abs(weights[-1] - 0.125) < 1e-9 # [midpoint(0.80, 0.95), 1.0] = 0.125
+
+
+def test_interpolated_pop_long_call():
+    """Long call at 68000, premium 400. Breakeven at 68400.
+    With outcomes at CDF [0.05..0.95], PoP should interpolate at zero-crossing."""
+    strat = StrategyCandidate("long_call", "bullish", "Long call", [68000], 400, 400)
+    outcomes = [65000, 66500, 67500, 68000, 68500, 69500, 72000]
+    pnl = strategy_pnl_values(strat, outcomes)
+    # pnl: [-400, -400, -400, -400, +100, +1100, +3600]
+    pop = _interpolated_pop(pnl, PERCENTILE_CDF)
+    # Zero crossing between index 3 (cdf=0.50, pnl=-400) and 4 (cdf=0.65, pnl=+100)
+    # frac = 400/500 = 0.80, positive portion = 0.15 * 0.20 = 0.03
+    # + [0.65,0.80] = 0.15 + [0.80,0.95] = 0.15 + right tail = 0.05
+    # total = 0.03 + 0.15 + 0.15 + 0.05 = 0.38
+    assert 0.35 < pop < 0.42
+
+
+def test_interpolated_pop_all_profitable():
+    pnl = [100, 200, 300, 400, 500, 600, 700]
+    pop = _interpolated_pop(pnl, PERCENTILE_CDF)
+    assert abs(pop - 1.0) < 1e-9
+
+
+def test_interpolated_pop_all_losing():
+    pnl = [-100, -200, -300, -400, -500, -600, -700]
+    pop = _interpolated_pop(pnl, PERCENTILE_CDF)
+    assert abs(pop - 0.0) < 1e-9
+
+
+def test_compute_payoff_with_cdf_differs_from_equal_weight():
+    """With CDF values, PoP and EV should differ from naive equal-weight."""
+    strat = StrategyCandidate("long_call", "bullish", "Long call", [68000], 400, 400)
+    outcomes = [65000, 66500, 67500, 68000, 68500, 69500, 72000]
+    pop_eq, ev_eq = compute_payoff_metrics(strat, outcomes)
+    pop_cdf, ev_cdf = compute_payoff_metrics(strat, outcomes, cdf_values=PERCENTILE_CDF)
+    # Equal-weight: 3/7 profitable = 42.9%, CDF-weighted should be different
+    assert pop_eq != pop_cdf
+    assert ev_eq != ev_cdf
+    # CDF-weighted should give lower PoP here (tails overweighted in equal-weight)
+    assert pop_cdf < pop_eq
+
+
+def test_outcome_prices_and_cdf_returns_matched_pairs():
+    pct = {"0.05": 64000, "0.2": 66000, "0.5": 67500, "0.95": 72000}
+    prices, cdf = _outcome_prices_and_cdf(pct)
+    assert len(prices) == len(cdf) == 4
+    assert cdf == [0.05, 0.2, 0.5, 0.95]
+    assert prices == [64000, 66000, 67500, 72000]
+
+
+def test_outcome_prices_and_cdf_empty_fallback():
+    prices, cdf = _outcome_prices_and_cdf({"0.5": 100})
+    assert prices == [100]
+    assert cdf == [0.5]
+
+
+def test_rank_strategies_uses_cdf_when_provided():
+    """rank_strategies with cdf_values should produce different scores than without."""
+    strat = StrategyCandidate("long_call", "bullish", "A", [68000], 400, 400)
+    outcomes = [65000, 66500, 67500, 68000, 68500, 69500, 72000]
+    scored_eq = rank_strategies([strat], "aligned_bullish", "bullish", outcomes, "medium", 68000)
+    scored_cdf = rank_strategies([strat], "aligned_bullish", "bullish", outcomes, "medium", 68000, cdf_values=PERCENTILE_CDF)
+    assert len(scored_eq) == 1 and len(scored_cdf) == 1
+    assert scored_eq[0].probability_of_profit != scored_cdf[0].probability_of_profit
+
+
+def test_forecast_path_uses_real_time_labels():
+    from main import _forecast_path
+    fake_steps = [
+        {"0.05": 100, "0.5": 105, "0.95": 110},
+        {"0.05": 99, "0.5": 106, "0.95": 112},
+        {"0.05": 98, "0.5": 107, "0.95": 114},
+    ]
+    lines_1h = _forecast_path(fake_steps, "1h", horizon_minutes=60)
+    assert any("0m" in line for line in lines_1h)
+    assert any("60m" in line for line in lines_1h)
+    assert not any("now" in line for line in lines_1h)
+    lines_24h = _forecast_path(fake_steps, "24h", horizon_minutes=1440)
+    assert any("0h" in line for line in lines_24h)
+    assert any("24h" in line for line in lines_24h)
+    assert any("median" in line for line in lines_24h)  # column header
