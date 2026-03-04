@@ -160,8 +160,16 @@ async function refresh() {
     signalRef = edge.ref_signal + " " + fmtEdge(edge.ref_edge_pct);
   }
 
+  // Log live price status for debugging
+  console.log("[Synth-Overlay] Edge response:", { 
+    live_price_used: edge.live_price_used, 
+    polymarket_prob: edge.polymarket_probability_up,
+    livePricesFromDOM: ctx.livePrices 
+  });
+
+  var liveStatus = edge.live_price_used ? " (Live)" : "";
   render({
-    status: "Synced — " + (edge.asset || "BTC") + " " + horizon + " forecast.",
+    status: "Synced — " + (edge.asset || "BTC") + " " + horizon + " forecast." + liveStatus,
     synthUp: fmtCentsFromProb(synthProbUp),
     synthDown: synthProbUp == null ? "—" : fmtCentsFromProb(1 - synthProbUp),
     edge: fmtEdge(edge.edge_pct),
