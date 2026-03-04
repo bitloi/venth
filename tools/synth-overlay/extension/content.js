@@ -20,79 +20,145 @@
   }
 
   /**
-   * Scrape live Polymarket prices from the DOM.
-   * Returns { upPrice: 0.XX, downPrice: 0.XX } or null if not found.
+   * Validate that a pair of binary market prices sums to roughly 100¢.
+   * Allows spread of 90-110 to account for market maker spread.
    */
-  function scrapeLivePrices() {
-    var upPrice = null;
-    var downPrice = null;
-    var bodyText = document.body ? document.body.innerText : "";
-    
-    // Strategy 1: Look for outcome elements with "Up/Down" and cent values
-    var allElements = document.querySelectorAll("div, span, button, a, p");
-    
-    for (var i = 0; i < allElements.length; i++) {
-      var el = allElements[i];
-      var text = (el.innerText || el.textContent || "").trim();
-      
-      if (text.length > 50) continue;
-      
-      var upMatch = text.match(/\b(Up|Yes)\b[\s\n]*(\d{1,2})\s*[¢c¢]/i);
-      var downMatch = text.match(/\b(Down|No)\b[\s\n]*(\d{1,2})\s*[¢c¢]/i);
-      
-      if (upMatch && upMatch[2] && upPrice === null) {
-        upPrice = parseInt(upMatch[2], 10) / 100;
-      }
-      if (downMatch && downMatch[2] && downPrice === null) {
-        downPrice = parseInt(downMatch[2], 10) / 100;
-      }
-      
-      if (upPrice === null) {
-        var upDecMatch = text.match(/\b(Up|Yes)\b[\s\n]*(0\.\d+)/i);
-        if (upDecMatch && upDecMatch[2]) upPrice = parseFloat(upDecMatch[2]);
-      }
-      if (downPrice === null) {
-        var downDecMatch = text.match(/\b(Down|No)\b[\s\n]*(0\.\d+)/i);
-        if (downDecMatch && downDecMatch[2]) downPrice = parseFloat(downDecMatch[2]);
-      }
-      
-      if (upPrice !== null && downPrice !== null) break;
-    }
+  function validatePricePair(up, down) {
+    if (up == null || down == null) return false;
+    var sum = Math.round((up + down) * 100);
+    return sum >= 90 && sum <= 110;
+  }
 
-    // Strategy 2: Container-based search
-    if (upPrice === null || downPrice === null) {
-      var containers = document.querySelectorAll("[class*='market'], [class*='outcome'], [class*='option'], [class*='card']");
-      for (var j = 0; j < containers.length; j++) {
-        var container = containers[j];
-        var containerText = (container.innerText || "").toLowerCase();
-        var priceMatch = containerText.match(/(\d{1,2})\s*[¢c¢]/);
-        if (!priceMatch) continue;
-        var price = parseInt(priceMatch[1], 10) / 100;
-        if ((containerText.indexOf("up") !== -1 || containerText.indexOf("yes") !== -1) && upPrice === null) {
-          upPrice = price;
-        } else if ((containerText.indexOf("down") !== -1 || containerText.indexOf("no") !== -1) && downPrice === null) {
-          downPrice = price;
+  /**
+   * Recursively search an object for Polymarket outcome prices.
+   * Looks for {outcomes: ["Up","Down"], outcomePrices: ["0.51","0.49"]} pattern.
+   */
+  function findOutcomePricesInObject(obj) {
+    if (!obj || typeof obj !== "object") return null;
+
+    if (Array.isArray(obj.outcomePrices) && Array.isArray(obj.outcomes)) {
+      var upIdx = -1, downIdx = -1;
+      for (var i = 0; i < obj.outcomes.length; i++) {
+        var name = String(obj.outcomes[i] || "").toLowerCase().trim();
+        if (name === "up" || name === "yes") upIdx = i;
+        else if (name === "down" || name === "no") downIdx = i;
+      }
+      if (upIdx >= 0 && downIdx >= 0) {
+        var upP = parseFloat(obj.outcomePrices[upIdx]);
+        var downP = parseFloat(obj.outcomePrices[downIdx]);
+        if (!isNaN(upP) && !isNaN(downP) && upP > 0 && downP > 0) {
+          return { upPrice: upP, downPrice: downP };
         }
       }
     }
 
-    // Strategy 3: Full body text search
-    if (upPrice === null || downPrice === null) {
-      var upBodyMatch = bodyText.match(/\bUp\b[^\d]*?(\d{1,2})\s*[¢c¢]/i);
-      var downBodyMatch = bodyText.match(/\bDown\b[^\d]*?(\d{1,2})\s*[¢c¢]/i);
-      if (upBodyMatch && upBodyMatch[1] && upPrice === null) upPrice = parseInt(upBodyMatch[1], 10) / 100;
-      if (downBodyMatch && downBodyMatch[1] && downPrice === null) downPrice = parseInt(downBodyMatch[1], 10) / 100;
+    var keys = Object.keys(obj);
+    for (var j = 0; j < keys.length; j++) {
+      var val = obj[keys[j]];
+      if (val && typeof val === "object") {
+        var result = findOutcomePricesInObject(val);
+        if (result) return result;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Scrape live Polymarket prices from the DOM.
+   * Returns { upPrice: 0.XX, downPrice: 0.XX } or null if not found.
+   *
+   * Three strategies in order of reliability:
+   * 1. __NEXT_DATA__ JSON (structured, from Next.js SSR)
+   * 2. Compact DOM elements with anchored "Up XX¢" patterns
+   * 3. Price-only leaf elements with parent context walk
+   */
+  function scrapeLivePrices() {
+    var upPrice = null;
+    var downPrice = null;
+
+    // Strategy 1: Parse __NEXT_DATA__ for structured market data
+    try {
+      var ndEl = document.getElementById("__NEXT_DATA__");
+      if (ndEl) {
+        var nd = JSON.parse(ndEl.textContent);
+        var fromND = findOutcomePricesInObject(nd);
+        if (fromND && validatePricePair(fromND.upPrice, fromND.downPrice)) {
+          console.log("[Synth-Overlay] Prices from __NEXT_DATA__:", fromND);
+          return fromND;
+        }
+      }
+    } catch (e) {
+      console.log("[Synth-Overlay] __NEXT_DATA__ parse failed:", e.message);
     }
 
-    if (upPrice !== null && downPrice !== null) {
+    // Strategy 2: Scan compact DOM elements for anchored "Up XX¢" / "Down XX¢"
+    // Only considers elements with very short text (< 20 chars) to avoid false positives.
+    // Regex is anchored (^...$) so entire text must match the pattern.
+    var els = document.querySelectorAll("button, a, span, div, p, [role='button']");
+    for (var i = 0; i < els.length; i++) {
+      var text = (els[i].textContent || "").trim();
+      if (text.length > 20 || text.length < 3) continue;
+
+      if (upPrice === null) {
+        var um = text.match(/^\s*(Up|Yes)\s*(\d{1,2})\s*[¢%]\s*$/i);
+        if (um) {
+          var up = parseInt(um[2], 10) / 100;
+          if (up >= 0.01 && up <= 0.99) upPrice = up;
+        }
+      }
+      if (downPrice === null) {
+        var dm = text.match(/^\s*(Down|No)\s*(\d{1,2})\s*[¢%]\s*$/i);
+        if (dm) {
+          var dn = parseInt(dm[2], 10) / 100;
+          if (dn >= 0.01 && dn <= 0.99) downPrice = dn;
+        }
+      }
+      if (upPrice !== null && downPrice !== null) break;
+    }
+
+    if (upPrice !== null && downPrice !== null && validatePricePair(upPrice, downPrice)) {
+      console.log("[Synth-Overlay] Prices from compact DOM:", { upPrice: upPrice, downPrice: downPrice });
       return { upPrice: upPrice, downPrice: downPrice };
     }
-    if (upPrice !== null && downPrice === null) {
+
+    // Strategy 3: Find leaf elements containing just "XX¢" or "XX%",
+    // then walk up the DOM tree to find "Up" or "Down" context.
+    upPrice = null;
+    downPrice = null;
+    for (var k = 0; k < els.length; k++) {
+      var el = els[k];
+      var t = (el.textContent || "").trim();
+      if (!t.match(/^\d{1,2}\s*[¢%]$/)) continue;
+      if (el.children.length > 1) continue;
+
+      var price = parseInt(t, 10) / 100;
+      if (price < 0.01 || price > 0.99) continue;
+
+      var parent = el.parentElement;
+      for (var d = 0; d < 4 && parent; d++) {
+        var pText = (parent.textContent || "").toLowerCase();
+        if (pText.length > 80) break;
+        if (/\bup\b/.test(pText) && upPrice === null) { upPrice = price; break; }
+        if (/\bdown\b/.test(pText) && downPrice === null) { downPrice = price; break; }
+        parent = parent.parentElement;
+      }
+      if (upPrice !== null && downPrice !== null) break;
+    }
+
+    if (upPrice !== null && downPrice !== null && validatePricePair(upPrice, downPrice)) {
+      console.log("[Synth-Overlay] Prices from leaf walk:", { upPrice: upPrice, downPrice: downPrice });
+      return { upPrice: upPrice, downPrice: downPrice };
+    }
+
+    // If only one price found, infer the other (no sum validation possible)
+    if (upPrice !== null && upPrice >= 0.01 && upPrice <= 0.99) {
       return { upPrice: upPrice, downPrice: 1 - upPrice };
     }
-    if (downPrice !== null && upPrice === null) {
+    if (downPrice !== null && downPrice >= 0.01 && downPrice <= 0.99) {
       return { upPrice: 1 - downPrice, downPrice: downPrice };
     }
+
+    console.log("[Synth-Overlay] Could not scrape live prices from DOM");
     return null;
   }
 
