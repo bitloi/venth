@@ -110,6 +110,7 @@ button {
   color: #6b7280;
   display: flex;
   justify-content: space-between;
+  flex-wrap: wrap;
 }
 
 /* Price comparison grid */

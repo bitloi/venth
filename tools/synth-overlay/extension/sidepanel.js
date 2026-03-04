@@ -171,11 +171,8 @@ function updateWithLivePrice(livePrices) {
   // Update primary timeframe signal with new edge
   var tfKey = cachedMarketType === "5min" ? "5m" : cachedMarketType === "15min" ? "15m" : 
               cachedMarketType === "hourly" ? "1h" : "24h";
-  var tfEl = els["signal" + tfKey.replace("m", "m").replace("h", "h")];
-  if (tfKey === "5m") els.signal5m.textContent = signal + " " + fmtEdge(edgePct);
-  else if (tfKey === "15m") els.signal15m.textContent = signal + " " + fmtEdge(edgePct);
-  else if (tfKey === "1h") els.signal1h.textContent = signal + " " + fmtEdge(edgePct);
-  else els.signal24h.textContent = signal + " " + fmtEdge(edgePct);
+  var tfMap = { "5m": els.signal5m, "15m": els.signal15m, "1h": els.signal1h, "24h": els.signal24h };
+  if (tfMap[tfKey]) tfMap[tfKey].textContent = signal + " " + fmtEdge(edgePct);
   
   // Update status to show live
   els.statusText.textContent = els.statusText.textContent.replace(/ \(Live\)$/, "") + " (Live)";
@@ -291,7 +288,6 @@ els.refreshBtn.addEventListener("click", function() {
 const SYNTH_POLL_INTERVAL_MS = 30000;
 
 // Poll progress bar animation
-var pollTimer = null;
 var pollStart = 0;
 
 function startPollProgress() {

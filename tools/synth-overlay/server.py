@@ -93,16 +93,9 @@ def _handle_updown_market(
 
     # Daily/hourly: preserve dual-horizon analysis (1h vs 24h cross-comparison)
     if market_type in ("daily", "hourly") and reference_data:
+        # primary_data already has live_prob_up override applied above
         daily = primary_data if market_type == "daily" else reference_data
         hourly = reference_data if market_type == "daily" else primary_data
-        # Apply live price override to the appropriate horizon data
-        if live_prob_up is not None:
-            if market_type == "daily":
-                daily = dict(daily)
-                daily["polymarket_probability_up"] = live_prob_up
-            else:
-                hourly = dict(hourly)
-                hourly["polymarket_probability_up"] = live_prob_up
         analyzer = EdgeAnalyzer(daily, hourly, pct_1h, pct_24h)
         result = analyzer.analyze(primary_horizon=primary_horizon)
         primary_src = daily if market_type == "daily" else hourly
