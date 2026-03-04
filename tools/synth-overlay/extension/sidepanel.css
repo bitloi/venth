@@ -157,6 +157,19 @@ button {
   font-size: 12px;
 }
 
+/* Primary timeframe highlighted */
+.tf-row.primary-tf {
+  background: rgba(59, 130, 246, 0.08);
+  border-radius: 4px;
+  margin: 2px -4px;
+  padding: 2px 4px;
+}
+
+.tf-row.primary-tf span,
+.tf-row.primary-tf strong {
+  font-weight: 700;
+}
+
 /* Poll progress bar - minimal */
 .poll-bar {
   width: 100%;

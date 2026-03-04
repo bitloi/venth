@@ -2,6 +2,10 @@
 
 const API_BASE = "http://127.0.0.1:8765";
 
+// Cache last Synth data for instant recalculation when live prices change
+var cachedSynthData = null;
+var cachedMarketType = null;
+
 const els = {
   statusText: document.getElementById("statusText"),
   synthUp: document.getElementById("synthUp"),
@@ -103,6 +107,11 @@ function render(state) {
   els.signal15m.textContent = state.signal15m || "—";
   els.signal1h.textContent = state.signal1h || "—";
   els.signal24h.textContent = state.signal24h || "—";
+  // Bold the primary timeframe row
+  els.signal5m.parentElement.classList.toggle("primary-tf", state.primaryTf === "5m");
+  els.signal15m.parentElement.classList.toggle("primary-tf", state.primaryTf === "15m");
+  els.signal1h.parentElement.classList.toggle("primary-tf", state.primaryTf === "1h");
+  els.signal24h.parentElement.classList.toggle("primary-tf", state.primaryTf === "24h");
   els.strength.textContent = state.strength;
   els.assetName.textContent = state.asset || "—";
   els.marketType.textContent = state.marketType || "—";
@@ -119,11 +128,60 @@ const EMPTY = {
   synthUp: "—", synthDown: "—", polyUp: "—", polyDown: "—",
   deltaUp: null, deltaDown: null, edge: "—",
   signal5m: "—", signal15m: "—", signal1h: "—", signal24h: "—",
+  primaryTf: null,
   strength: "—", asset: "—", marketType: "—",
   analysis: "—", noTrade: false, invalidation: "—",
   confPct: 0, confColor: "#9ca3af", confText: "—",
   lastUpdate: "—",
 };
+
+// Calculate edge percentage from Synth and Polymarket probabilities
+function calcEdgePct(synthProb, polyProb) {
+  if (synthProb == null || polyProb == null) return null;
+  return Math.round((synthProb - polyProb) * 100);
+}
+
+// Update UI instantly when live prices change (without full API refresh)
+function updateWithLivePrice(livePrices) {
+  if (!cachedSynthData || !livePrices) return;
+  
+  var synthProbUp = cachedSynthData.synth_probability_up;
+  var polyProbUp = livePrices.upPrice;
+  var polyProbDown = livePrices.downPrice;
+  
+  // Recalculate edge with live price
+  var edgePct = calcEdgePct(synthProbUp, polyProbUp);
+  var signal = edgePct > 0 ? "BUY" : edgePct < 0 ? "SELL" : "HOLD";
+  
+  // Update Polymarket prices
+  els.polyUp.textContent = fmtCentsFromProb(polyProbUp);
+  els.polyDown.textContent = fmtCentsFromProb(polyProbDown);
+  
+  // Update deltas
+  var deltaUp = fmtDelta(synthProbUp, polyProbUp);
+  var deltaDown = fmtDelta(synthProbUp != null ? 1 - synthProbUp : null, polyProbDown);
+  els.deltaUp.textContent = deltaUp.text;
+  els.deltaUp.className = "delta " + deltaUp.cls;
+  els.deltaDown.textContent = deltaDown.text;
+  els.deltaDown.className = "delta " + deltaDown.cls;
+  
+  // Update edge
+  els.edgeValue.textContent = fmtEdge(edgePct);
+  
+  // Update primary timeframe signal with new edge
+  var tfKey = cachedMarketType === "5min" ? "5m" : cachedMarketType === "15min" ? "15m" : 
+              cachedMarketType === "hourly" ? "1h" : "24h";
+  var tfEl = els["signal" + tfKey.replace("m", "m").replace("h", "h")];
+  if (tfKey === "5m") els.signal5m.textContent = signal + " " + fmtEdge(edgePct);
+  else if (tfKey === "15m") els.signal15m.textContent = signal + " " + fmtEdge(edgePct);
+  else if (tfKey === "1h") els.signal1h.textContent = signal + " " + fmtEdge(edgePct);
+  else els.signal24h.textContent = signal + " " + fmtEdge(edgePct);
+  
+  // Update status to show live
+  els.statusText.textContent = els.statusText.textContent.replace(/ \(Live\)$/, "") + " (Live)";
+  
+  console.log("[Synth-Overlay] Live price update:", { polyProbUp, edgePct, signal });
+}
 
 async function refresh() {
   render(Object.assign({}, EMPTY, { status: "Refreshing…" }));
@@ -162,6 +220,10 @@ async function refresh() {
   var mtype = edge.market_type || "daily";
   var asset = edge.asset || "BTC";
 
+  // Cache Synth data for instant live price updates
+  cachedSynthData = edge;
+  cachedMarketType = mtype;
+
   // Log live price status for debugging
   console.log("[Synth-Overlay] Edge response:", { 
     live_price_used: edge.live_price_used, 
@@ -169,22 +231,14 @@ async function refresh() {
     livePricesFromDOM: ctx.livePrices 
   });
 
-  // Get Polymarket price (from API response)
-  var polyProbUp = edge.polymarket_probability_up;
+  // Get Polymarket price (from API response or live DOM)
+  var polyProbUp = ctx.livePrices ? ctx.livePrices.upPrice : edge.polymarket_probability_up;
   var polyProbDown = polyProbUp != null ? 1 - polyProbUp : null;
 
   // Calculate deltas (Synth - Poly)
   var deltaUp = fmtDelta(synthProbUp, polyProbUp);
   var deltaDown = fmtDelta(synthProbUp != null ? 1 - synthProbUp : null, polyProbDown);
 
-  // Fetch all timeframes for this asset (in parallel)
-  var tfSlugs = {
-    "5m": asset.toLowerCase() + "-updown-5m-" + Date.now(),
-    "15m": asset.toLowerCase() + "-updown-15m-" + Date.now(),
-    "1h": asset.toLowerCase() + "-updown-1h-" + Date.now(),
-    "24h": asset.toLowerCase() + "-updown-24h-" + Date.now(),
-  };
-  
   // Build signals from response - map current market type to its slot
   var signals = { "5m": "—", "15m": "—", "1h": "—", "24h": "—" };
   var tfKey = mtype === "5min" ? "5m" : mtype === "15min" ? "15m" : mtype === "hourly" ? "1h" : "24h";
@@ -196,7 +250,7 @@ async function refresh() {
     signals["24h"] = edge.signal_24h + " " + fmtEdge(edge.edge_24h_pct);
   }
 
-  var liveStatus = edge.live_price_used ? " (Live)" : "";
+  var liveStatus = ctx.livePrices ? " (Live)" : "";
   render({
     status: "Synced — " + asset + " " + horizon + " forecast." + liveStatus,
     synthUp: fmtCentsFromProb(synthProbUp),
@@ -210,6 +264,7 @@ async function refresh() {
     signal15m: signals["15m"],
     signal1h: signals["1h"],
     signal24h: signals["24h"],
+    primaryTf: tfKey,
     strength: edge.strength || "—",
     asset: asset,
     marketType: mtype,
@@ -254,6 +309,14 @@ function stopPollProgress() {
   els.pollProgress.style.transition = "none";
   els.pollProgress.style.width = "0%";
 }
+
+// Listen for real-time price updates from content script
+chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
+  if (message && message.type === "synth:priceUpdate") {
+    console.log("[Synth-Overlay] Received live price update:", message.prices);
+    updateWithLivePrice(message.prices);
+  }
+});
 
 // Start polling
 refresh();
