@@ -45,6 +45,15 @@ chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
   }
 });
 
+// Poll immediately when user switches away from a Polymarket tab
+chrome.tabs.onActivated.addListener(function (activeInfo) {
+  chrome.tabs.get(activeInfo.tabId, function (tab) {
+    if (tab && tab.url && !isSupportedUrl(tab.url)) {
+      pollWatchlist();
+    }
+  });
+});
+
 // ---- Alert Storage Helpers ----
 
 function loadAlertSettings(callback) {
@@ -99,6 +108,7 @@ chrome.storage.onChanged.addListener(function (changes, area) {
   if (area !== "local") return;
   if (changes[STORE_KEYS.enabled] || changes[STORE_KEYS.watchlist]) {
     syncAlarmState();
+    pollWatchlist();
   }
 });
 
