@@ -1,0 +1,642 @@
+/* Tide Chart — gTrade Trading Integration
+ * Wallet connection, chain switching, and trade execution
+ * via Gains Network on Arbitrum One.
+ */
+
+var walletState = {
+  connected: false,
+  address: null,
+  provider: null,
+  signer: null,
+  chainId: null,
+  usdcBalance: '0'
+};
+
+var gtradeConfig = null;
+var tradePending = false;
+
+function shortAddr(addr) {
+  return addr ? addr.slice(0, 6) + '...' + addr.slice(-4) : '';
+}
+
+/* ========== Toast Notification System ========== */
+function showToast(message, type, duration) {
+  type = type || 'info';
+  duration = duration || 5000;
+  var container = document.getElementById('toast-container');
+  if (!container) return;
+  var toast = document.createElement('div');
+  toast.className = 'toast ' + type;
+  var icons = { success: '\u2713', error: '\u2717', info: '\u2139' };
+  toast.innerHTML = '<span class="toast-icon">' + (icons[type] || icons.info) + '</span>'
+    + '<span class="toast-msg">' + message + '</span>';
+  container.appendChild(toast);
+  setTimeout(function() {
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateY(10px)';
+    toast.style.transition = 'all 0.3s ease';
+    setTimeout(function() { toast.remove(); }, 300);
+  }, duration);
+}
+
+function showTradeStatus(msg, isError, isHtml) {
+  var el = document.getElementById('trade-status');
+  if (!el) return;
+  if (isHtml) { el.innerHTML = msg; } else { el.textContent = msg; }
+  el.className = 'trade-status ' + (isError ? 'error' : 'success');
+  el.style.display = 'block';
+}
+
+function hideTradeStatus() {
+  var el = document.getElementById('trade-status');
+  if (el) el.style.display = 'none';
+  var fb = document.getElementById('trade-fallback');
+  if (fb) fb.style.display = 'none';
+}
+
+/* ========== Client-Side Trade Validation (gTrade Protocol Guards) ========== */
+function getAssetLimits(asset) {
+  if (!gtradeConfig || !gtradeConfig.pairs || !gtradeConfig.group_limits) return null;
+  var pair = gtradeConfig.pairs[asset];
+  if (!pair) return null;
+  return gtradeConfig.group_limits[pair.group] || null;
+}
+
+function validateTradeClient() {
+  var execBtn = document.getElementById('trade-exec-btn');
+  var posEl = document.getElementById('trade-pos-size');
+  if (!execBtn) return;
+
+  var asset = (document.getElementById('trade-asset') || {}).value || '';
+  var leverage = parseFloat((document.getElementById('trade-leverage') || {}).value) || 0;
+  var collateral = parseFloat((document.getElementById('trade-collateral') || {}).value) || 0;
+
+  var limits = getAssetLimits(asset);
+  var minCol = (gtradeConfig && gtradeConfig.collateral_limits) ? gtradeConfig.collateral_limits.min_usd : 5;
+
+  var positionSize = collateral * leverage;
+
+  // Update position size display
+  if (posEl) {
+    var fmt = positionSize.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    posEl.textContent = '$' + fmt;
+    posEl.className = 'trade-pos-size' + (limits && positionSize > 0 && positionSize < limits.min_position_usd ? ' warning' : '');
+  }
+
+  // Guard: no wallet
+  // Reset direction class
+  execBtn.className = 'trade-exec-btn';
+
+  if (!walletState.connected) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Connect Wallet';
+    return;
+  }
+
+  // Guard: wrong chain
+  if (walletState.chainId !== 42161) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Switch to Arbitrum';
+    return;
+  }
+
+  // Guard: no asset
+  if (!asset || !limits) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Select an Asset';
+    return;
+  }
+
+  // Guard: collateral empty
+  if (collateral <= 0) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Enter Collateral';
+    return;
+  }
+
+  // Guard: collateral below minimum
+  if (collateral < minCol) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Min Collateral: $' + minCol;
+    return;
+  }
+
+  // Guard: collateral above maximum
+  if (collateral > limits.max_collateral_usd) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Max Collateral: $' + limits.max_collateral_usd.toLocaleString();
+    return;
+  }
+
+  // Guard: leverage out of range
+  if (leverage < limits.min_leverage) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Min Leverage: ' + limits.min_leverage + 'x';
+    return;
+  }
+  if (leverage > limits.max_leverage) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Max Leverage: ' + limits.max_leverage + 'x';
+    return;
+  }
+
+  // Guard: position size below protocol minimum
+  if (positionSize < limits.min_position_usd) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Min Position: $' + limits.min_position_usd.toLocaleString();
+    return;
+  }
+
+  // Guard: insufficient USDC balance
+  var usdcBal = parseFloat(walletState.usdcBalance) || 0;
+  if (usdcBal < collateral) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Insufficient USDC (have: $' + usdcBal.toFixed(2) + ')';
+    return;
+  }
+
+  // Guard: trade in progress
+  if (tradePending) {
+    execBtn.disabled = true;
+    execBtn.textContent = 'Processing...';
+    return;
+  }
+
+  // All guards pass — enable button with direction-aware styling
+  var direction = (document.getElementById('trade-direction') || {}).value || 'long';
+  execBtn.disabled = false;
+  execBtn.className = 'trade-exec-btn ' + direction;
+  execBtn.textContent = 'Open ' + direction.charAt(0).toUpperCase() + direction.slice(1) + ' ' + asset;
+}
+
+function updateWalletUI() {
+  var btn = document.getElementById('wallet-btn');
+  var info = document.getElementById('wallet-info');
+  var balEl = document.getElementById('usdc-balance');
+  var tradeSection = document.getElementById('trade-form-section');
+  var chainBadge = document.getElementById('chain-badge');
+
+  if (walletState.connected) {
+    btn.textContent = shortAddr(walletState.address);
+    btn.classList.add('connected');
+    if (info) info.style.display = 'flex';
+    if (balEl) balEl.textContent = parseFloat(walletState.usdcBalance).toFixed(2);
+    if (tradeSection) tradeSection.style.display = 'block';
+    if (chainBadge) {
+      if (walletState.chainId === 42161) {
+        chainBadge.textContent = 'Arbitrum';
+        chainBadge.className = 'chain-badge arb-ok';
+      } else {
+        chainBadge.textContent = 'Wrong Chain';
+        chainBadge.className = 'chain-badge arb-wrong';
+      }
+      chainBadge.style.display = 'inline-block';
+    }
+  } else {
+    btn.textContent = 'Connect Wallet';
+    btn.classList.remove('connected');
+    if (info) info.style.display = 'none';
+    if (chainBadge) chainBadge.style.display = 'none';
+  }
+}
+
+async function connectWallet() {
+  if (walletState.connected) {
+    walletState = { connected: false, address: null, provider: null, signer: null, chainId: null, usdcBalance: '0' };
+    updateWalletUI();
+    hideTradeStatus();
+    return;
+  }
+
+  if (typeof window.ethereum === 'undefined') {
+    showToast('No wallet detected. Install <a href="https://metamask.io" target="_blank">MetaMask</a> or any EIP-1193 wallet.', 'error', 8000);
+    return;
+  }
+
+  try {
+    var provider = new ethers.BrowserProvider(window.ethereum);
+    await provider.send('eth_requestAccounts', []);
+    var signer = await provider.getSigner();
+    var address = await signer.getAddress();
+    var network = await provider.getNetwork();
+
+    walletState.connected = true;
+    walletState.address = address;
+    walletState.provider = provider;
+    walletState.signer = signer;
+    walletState.chainId = Number(network.chainId);
+
+    updateWalletUI();
+
+    if (walletState.chainId !== 42161) {
+      await switchToArbitrum();
+    }
+
+    await refreshUSDCBalance();
+    loadOpenTrades();
+    showToast('Connected: ' + shortAddr(address), 'success');
+    validateTradeClient();
+  } catch (e) {
+    if (e.code === 4001 || (e.info && e.info.error && e.info.error.code === 4001)) {
+      showToast('Connection rejected by user', 'error');
+    } else {
+      showToast('Connection failed: ' + (e.message || String(e)), 'error');
+    }
+  }
+}
+
+async function switchToArbitrum() {
+  if (!window.ethereum) return;
+  try {
+    await window.ethereum.request({
+      method: 'wallet_switchEthereumChain',
+      params: [{ chainId: '0xa4b1' }]
+    });
+  } catch (err) {
+    if (err.code === 4902) {
+      await window.ethereum.request({
+        method: 'wallet_addEthereumChain',
+        params: [{
+          chainId: '0xa4b1',
+          chainName: 'Arbitrum One',
+          rpcUrls: ['https://arb1.arbitrum.io/rpc'],
+          blockExplorerUrls: ['https://arbiscan.io'],
+          nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }
+        }]
+      });
+    } else {
+      throw err;
+    }
+  }
+  walletState.provider = new ethers.BrowserProvider(window.ethereum);
+  walletState.signer = await walletState.provider.getSigner();
+  var net = await walletState.provider.getNetwork();
+  walletState.chainId = Number(net.chainId);
+  updateWalletUI();
+}
+
+async function refreshUSDCBalance() {
+  if (!walletState.connected || !gtradeConfig) return;
+  try {
+    var erc20Abi = ['function balanceOf(address) view returns (uint256)'];
+    var usdc = new ethers.Contract(gtradeConfig.usdc_contract, erc20Abi, walletState.provider);
+    var raw = await usdc.balanceOf(walletState.address);
+    walletState.usdcBalance = ethers.formatUnits(raw, gtradeConfig.usdc_decimals);
+    updateWalletUI();
+  } catch (e) {
+    console.warn('Could not fetch USDC balance:', e.message);
+  }
+}
+
+function populateTradeAssets() {
+  var sel = document.getElementById('trade-asset');
+  if (!sel || !gtradeConfig) return;
+  sel.innerHTML = '';
+  Object.keys(gtradeConfig.pairs).forEach(function(asset) {
+    var opt = document.createElement('option');
+    opt.value = asset;
+    var price = (typeof currentAssets !== 'undefined' && currentAssets[asset])
+      ? ' ($' + currentAssets[asset].current_price.toFixed(2) + ')'
+      : '';
+    opt.textContent = gtradeConfig.pairs[asset].name + price;
+    sel.appendChild(opt);
+  });
+}
+
+function updateTradePreview() {
+  // Run client-side guards on every input change
+  validateTradeClient();
+
+  var assetEl = document.getElementById('trade-asset');
+  var dirEl = document.getElementById('trade-direction');
+  var levEl = document.getElementById('trade-leverage');
+  var colEl = document.getElementById('trade-collateral');
+  var preview = document.getElementById('trade-preview');
+  if (!assetEl || !preview) return;
+
+  var asset = assetEl.value;
+  var direction = dirEl.value;
+  var leverage = parseFloat(levEl.value) || 0;
+  var collateral = parseFloat(colEl.value) || 0;
+
+  if (!asset || leverage <= 0 || collateral <= 0) {
+    preview.style.display = 'none';
+    return;
+  }
+
+  var posSize = collateral * leverage;
+  var price = (typeof currentAssets !== 'undefined' && currentAssets[asset])
+    ? currentAssets[asset].current_price : 0;
+  var fmt = function(n) { return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); };
+
+  preview.style.display = 'block';
+  var html =
+    '<div class="preview-row"><span>Position Size</span><span>$' + fmt(posSize) + '</span></div>' +
+    '<div class="preview-row"><span>Direction</span><span class="' +
+      (direction === 'long' ? 'positive' : 'negative') + '">' +
+      direction.toUpperCase() + ' ' + leverage + 'x</span></div>' +
+    '<div class="preview-row"><span>Entry Price</span><span>$' + fmt(price) + ' (market)</span></div>' +
+    '<div class="preview-row"><span>Collateral</span><span>' + fmt(collateral) + ' USDC</span></div>';
+
+  var tp = parseFloat(document.getElementById('trade-tp').value);
+  var sl = parseFloat(document.getElementById('trade-sl').value);
+  var slippage = parseFloat(document.getElementById('trade-slippage').value) || 1;
+  if (tp > 0) html += '<div class="preview-row"><span>Take Profit</span><span class="positive">+' + tp + '%</span></div>';
+  if (sl > 0) html += '<div class="preview-row"><span>Stop Loss</span><span class="negative">-' + sl + '%</span></div>';
+  html += '<div class="preview-row"><span>Max Slippage</span><span>' + slippage.toFixed(1) + '%</span></div>';
+  html += '<div class="preview-row"><span>Protocol</span><span>gTrade &middot; Arbitrum</span></div>';
+  preview.innerHTML = html;
+}
+
+async function executeTrade() {
+  hideTradeStatus();
+  var fb = document.getElementById('trade-fallback');
+  if (fb) fb.style.display = 'none';
+  if (tradePending) return;
+
+  if (!walletState.connected) {
+    showToast('Connect your wallet first', 'error');
+    return;
+  }
+
+  if (walletState.chainId !== 42161) {
+    showToast('Switching to Arbitrum...', 'info', 3000);
+    try { await switchToArbitrum(); } catch (_) { /* user rejected */ }
+    return;
+  }
+
+  var asset = document.getElementById('trade-asset').value;
+  var direction = document.getElementById('trade-direction').value;
+  var leverage = parseFloat(document.getElementById('trade-leverage').value);
+  var collateral = parseFloat(document.getElementById('trade-collateral').value);
+  var tpPct = parseFloat(document.getElementById('trade-tp').value) || 0;
+  var slPct = parseFloat(document.getElementById('trade-sl').value) || 0;
+
+  // TP/SL are encoded as absolute prices; with openPrice=0 (market) we leave them as 0
+  // and the contract will interpret them as no TP/SL. For now this is the safest approach.
+  // Users who need TP/SL can set them after opening via the gTrade UI.
+  var tpScaled = 0;
+  var slScaled = 0;
+
+  // Server-side validation (mirrors client-side guards)
+  var valResp = await fetch('/api/gtrade/validate-trade', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ asset: asset, direction: direction, leverage: leverage, collateral_usd: collateral })
+  });
+  var valData = await valResp.json();
+  if (!valData.valid) {
+    showToast(valData.error, 'error');
+    return;
+  }
+
+  tradePending = true;
+  var execBtn = document.getElementById('trade-exec-btn');
+  var originalText = execBtn.textContent;
+  execBtn.disabled = true;
+  execBtn.textContent = 'Processing...';
+
+  try {
+    // USDC amounts: native 1e6 precision for both ERC-20 ops and trade struct
+    var collateralAmount = ethers.parseUnits(collateral.toString(), gtradeConfig.usdc_decimals);
+
+    // Check and approve USDC allowance (uses native USDC precision: 1e6)
+    var erc20Abi = [
+      'function allowance(address,address) view returns (uint256)',
+      'function approve(address,uint256) returns (bool)'
+    ];
+    var usdc = new ethers.Contract(gtradeConfig.usdc_contract, erc20Abi, walletState.signer);
+    var allowance = await usdc.allowance(walletState.address, gtradeConfig.trading_contract);
+
+    if (allowance < collateralAmount) {
+      showToast('Approving USDC spend...', 'info', 10000);
+      execBtn.textContent = 'Approving USDC...';
+      var approveTx = await usdc.approve(gtradeConfig.trading_contract, ethers.MaxUint256);
+      await approveTx.wait();
+      showToast('USDC approved', 'success', 3000);
+    }
+
+    // Resolve pair index from gTrade API
+    var pairResp = await fetch('/api/gtrade/resolve-pair?asset=' + asset);
+    var pairData = await pairResp.json();
+
+    if (pairData.pair_index === null || pairData.pair_index === undefined) {
+      showToast('Could not resolve gTrade pair index for ' + asset + '. Try again later.', 'error');
+      showTradeFallback(asset);
+      return;
+    }
+
+    // Build trade struct matching ITradingStorage.Trade on-chain
+    // Verified selector: 0x5bfcc4f8 via https://api.openchain.xyz
+    var tradeAbi = [
+      'function openTrade(' +
+        'tuple(address user, uint32 pairIndex, uint16 index, uint24 leverage, ' +
+        'bool long, bool isOpen, uint8 collateralIndex, uint8 tradeType, ' +
+        'uint120 collateralAmount, uint64 openPrice, uint64 tp, uint64 sl, ' +
+        'bool isCounterTrade, uint160 positionSizeToken, uint24 maxClosingSlippageP) _trade, ' +
+        'uint16 _maxSlippageP, address _referrer)'
+    ];
+
+    var diamond = new ethers.Contract(gtradeConfig.trading_contract, tradeAbi, walletState.signer);
+    var leverageScaled = Math.round(leverage * 1000);
+
+    // slippageP uses 1e3 precision: 1% = 1000, 0.5% = 500
+    var slippageInput = parseFloat(document.getElementById('trade-slippage').value) || 1;
+    var slippageP = Math.round(slippageInput * 1000);
+
+    var trade = {
+      user: walletState.address,
+      pairIndex: pairData.pair_index,
+      index: 0,
+      leverage: leverageScaled,
+      long: direction === 'long',
+      isOpen: false,
+      collateralIndex: gtradeConfig.collateral_index,
+      tradeType: 0,                // 0 = market order
+      collateralAmount: collateralAmount,
+      openPrice: 0,                // 0 = market price
+      tp: tpScaled,
+      sl: slScaled,
+      isCounterTrade: false,
+      positionSizeToken: 0,
+      maxClosingSlippageP: slippageP
+    };
+
+    showToast('Opening ' + direction + ' ' + asset + '...', 'info', 15000);
+    execBtn.textContent = 'Opening Trade...';
+    var tx = await diamond.openTrade(trade, slippageP, ethers.ZeroAddress);
+    showToast('Transaction submitted. Waiting for confirmation...', 'info', 20000);
+    var receipt = await tx.wait();
+
+    showToast(
+      'Trade opened! <a href="https://arbiscan.io/tx/' + receipt.hash + '" target="_blank" rel="noopener">View on Arbiscan</a>',
+      'success', 10000
+    );
+    await refreshUSDCBalance();
+    loadOpenTrades();
+
+  } catch (e) {
+    var msg = e.reason || e.shortMessage || e.message || 'Transaction failed';
+    if (e.code === 4001 || (e.info && e.info.error && e.info.error.code === 4001)) {
+      msg = 'Transaction rejected by user';
+    } else if (msg.toLowerCase().indexOf('insufficient') !== -1) {
+      msg = 'Insufficient funds (check USDC balance and ETH for gas)';
+    } else if (msg.toLowerCase().indexOf('market') !== -1 || msg.toLowerCase().indexOf('closed') !== -1) {
+      msg = 'Market may be closed. Equity markets trade during US hours.';
+    }
+    if (msg.length > 150) msg = msg.slice(0, 150) + '...';
+    showToast(msg, 'error', 8000);
+    showTradeFallback(asset);
+  } finally {
+    tradePending = false;
+    execBtn.textContent = originalText;
+    validateTradeClient();
+  }
+}
+
+function showTradeFallback(asset) {
+  var el = document.getElementById('trade-fallback');
+  if (el) {
+    el.style.display = 'block';
+    var link = el.querySelector('a');
+    if (link) link.href = 'https://gains.trade/trading/' + asset + '-USD';
+  }
+}
+
+function selectTradeAsset(asset) {
+  var sel = document.getElementById('trade-asset');
+  if (sel) {
+    for (var i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === asset) { sel.selectedIndex = i; break; }
+    }
+  }
+  var section = document.getElementById('trade-form-section');
+  if (section) {
+    section.style.display = 'block';
+    section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  updateTradePreview();
+}
+
+async function loadOpenTrades() {
+  if (!walletState.connected) return;
+  var container = document.getElementById('open-trades-list');
+  if (!container) return;
+  try {
+    var resp = await fetch('/api/gtrade/open-trades?address=' + walletState.address);
+    var data = await resp.json();
+    var trades = data.trades || [];
+    var pairNames = data.pair_names || {};
+    if (trades.length === 0) {
+      container.innerHTML = '<div class="no-trades">No open positions</div>';
+      return;
+    }
+    var html = '';
+    trades.forEach(function(item) {
+      var t = item.trade || item;
+      var pairIdx = parseInt(t.pairIndex || '0');
+      var tradeIdx = parseInt(t.index || '0');
+      var dir = t.long ? 'LONG' : 'SHORT';
+      var dirClass = t.long ? 'positive' : 'negative';
+      var pairLabel = pairNames[pairIdx] || ('Pair #' + pairIdx);
+      var lev = t.leverage ? (parseFloat(t.leverage) / 1000).toFixed(0) + 'x' : '?x';
+      var colRaw = BigInt(t.collateralAmount || '0');
+      var colIdx = parseInt(t.collateralIndex || '3');
+      var colDecimals = (colIdx === 3) ? 6 : 18;
+      var col = (Number(colRaw) / Math.pow(10, colDecimals)).toFixed(2);
+      var openPrice = t.openPrice ? (parseFloat(t.openPrice) / 1e10).toFixed(2) : '?';
+      html += '<div class="open-trade-row">' +
+        '<span class="' + dirClass + '">' + dir + ' ' + lev + '</span>' +
+        '<span>' + pairLabel + '</span>' +
+        '<span>Entry: $' + openPrice + '</span>' +
+        '<span>' + col + ' USDC</span>' +
+        '<button class="close-trade-btn" onclick="closeTrade(' + tradeIdx + ')" title="Close position">✕</button>' +
+        '</div>';
+    });
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = '<div class="no-trades">Could not load trades</div>';
+  }
+}
+
+async function closeTrade(tradeIndex) {
+  if (!walletState.connected || !walletState.signer) {
+    showToast('Connect wallet first', 'error');
+    return;
+  }
+  if (walletState.chainId !== 42161) {
+    showToast('Switch to Arbitrum One', 'error');
+    return;
+  }
+  if (tradePending) {
+    showToast('Transaction already in progress', 'error');
+    return;
+  }
+  tradePending = true;
+  try {
+    var closeAbi = ['function closeTradeMarket(uint32 _index, uint64 _expectedPrice)'];
+    var diamond = new ethers.Contract(gtradeConfig.trading_contract, closeAbi, walletState.signer);
+    showToast('Closing position...', 'info', 15000);
+    var tx = await diamond.closeTradeMarket(tradeIndex, 0);
+    showToast('Close submitted. Waiting for confirmation...', 'info', 20000);
+    var receipt = await tx.wait();
+    showToast(
+      'Position closed! <a href="https://arbiscan.io/tx/' + receipt.hash + '" target="_blank" rel="noopener">View on Arbiscan</a>',
+      'success', 10000
+    );
+    await refreshUSDCBalance();
+    loadOpenTrades();
+  } catch (e) {
+    var msg = e.reason || e.shortMessage || e.message || 'Close trade failed';
+    if (e.code === 4001 || (e.info && e.info.error && e.info.error.code === 4001)) {
+      msg = 'Transaction rejected by user';
+    }
+    if (msg.length > 150) msg = msg.slice(0, 150) + '...';
+    showToast(msg, 'error', 8000);
+  } finally {
+    tradePending = false;
+  }
+}
+
+// Listen for wallet account/chain changes
+if (typeof window !== 'undefined' && window.ethereum) {
+  window.ethereum.on('accountsChanged', function(accounts) {
+    if (accounts.length === 0) {
+      walletState = { connected: false, address: null, provider: null, signer: null, chainId: null, usdcBalance: '0' };
+      updateWalletUI();
+      validateTradeClient();
+    } else {
+      walletState.address = accounts[0];
+      updateWalletUI();
+      refreshUSDCBalance();
+      loadOpenTrades();
+      validateTradeClient();
+    }
+  });
+  window.ethereum.on('chainChanged', function(chainId) {
+    walletState.chainId = parseInt(chainId, 16);
+    updateWalletUI();
+    refreshUSDCBalance();
+    loadOpenTrades();
+    validateTradeClient();
+  });
+}
+
+// Initialize gTrade config on load
+(async function initGtradeConfig() {
+  try {
+    var resp = await fetch('/api/gtrade/config');
+    gtradeConfig = await resp.json();
+    populateTradeAssets();
+    validateTradeClient();
+  } catch (e) {
+    console.warn('Could not load gTrade config:', e);
+  }
+})();
+
+/* Silent auto-reconnect on page load */
+if (typeof window !== 'undefined' && window.ethereum) {
+  window.ethereum.request({ method: 'eth_accounts' }).then(function(accounts) {
+    if (accounts.length > 0) { connectWallet(); }
+  }).catch(function() {});
+}
