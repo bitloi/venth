@@ -47,10 +47,12 @@ chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
   }
 });
 
-// Poll immediately when user switches away from a Polymarket tab
+// Poll immediately when user switches away from a Polymarket tab.
+// If tab.url is unavailable (e.g. chrome:// pages), assume non-Polymarket.
 chrome.tabs.onActivated.addListener(function (activeInfo) {
   chrome.tabs.get(activeInfo.tabId, function (tab) {
-    if (tab && tab.url && !isSupportedUrl(tab.url)) {
+    if (chrome.runtime.lastError || !tab) { pollWatchlist(); return; }
+    if (!tab.url || !isSupportedUrl(tab.url)) {
       pollWatchlist();
     }
   });
