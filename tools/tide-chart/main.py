@@ -598,7 +598,7 @@ def generate_dashboard_html(client) -> str:
         '      </div>\n'
         '      <div class="trade-field">\n'
         '        <label for="trade-slippage">Max Slippage (%)</label>\n'
-        '        <input type="number" id="trade-slippage" min="0.1" max="5" step="0.1" value="1" oninput="updateTradePreview()">\n'
+        '        <input type="number" id="trade-slippage" min="0.1" max="5" step="0.1" value="1.5" oninput="updateTradePreview()">\n'
         '      </div>\n'
         '      <div class="trade-field" style="width:100%">\n'
         '        <label>Position Size</label>\n'
@@ -859,6 +859,14 @@ def create_app(client=None) -> Flask:
 
     app = Flask(__name__)
 
+    @app.after_request
+    def add_no_cache_headers(response):
+        if request.path.startswith("/api/") or request.path.endswith(".js"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
     @app.route("/")
     def index():
         html = generate_dashboard_html(client)
@@ -950,7 +958,15 @@ def create_app(client=None) -> Flask:
         except Exception:
             trading_vars = None
         pair_index = resolve_pair_index(asset, trading_vars, skip_fetch=True)
-        return jsonify({"asset": asset, "pair_index": pair_index})
+        # Include fresh price for the frontend openTrade struct
+        current_price = None
+        try:
+            summary = client.get_asset_summary(asset)
+            if summary and "current_price" in summary:
+                current_price = summary["current_price"]
+        except Exception:
+            pass
+        return jsonify({"asset": asset, "pair_index": pair_index, "current_price": current_price})
 
     @app.route("/api/gtrade/open-trades")
     def gtrade_open_trades():

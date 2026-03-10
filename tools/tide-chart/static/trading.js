@@ -372,11 +372,52 @@ async function executeTrade() {
   var tpPct = parseFloat(document.getElementById('trade-tp').value) || 0;
   var slPct = parseFloat(document.getElementById('trade-sl').value) || 0;
 
-  // TP/SL are encoded as absolute prices; with openPrice=0 (market) we leave them as 0
-  // and the contract will interpret them as no TP/SL. For now this is the safest approach.
-  // Users who need TP/SL can set them after opening via the gTrade UI.
+  // Fetch live price from Chainlink on-chain feed (same oracle gTrade uses)
+  var chainlinkFeeds = {
+    'BTC': '0x6ce185860a4963106506C203335A2910413708e9',
+    'ETH': '0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612',
+    'SOL': '0x24ceA4b8ce57cdA5058b924B9B9987992450590c',
+    'DOGE': '0x9A7FB1b3950837a8D9b40517626E11D4127C098C',
+    'AAPL': '0xc4A750B3E14bEF69Db22F2f5AaEEb77b6d1A4E42',
+    'TSLA': '0x3609baAa0a9b1F0FE4B300b15BCa8bBdB8C22E66',
+    'AMZN': '0xd6a77691f071E98Df7217BED98f38ae6d2313EBA',
+    'GOOGL': '0x1D1a83331e9D255EB1Aaf75026B60dFD00A252ba',
+    'META': '0xcd1BD86FDc33080DCF1b5715B6FCe04eC6F85845',
+    'NVDA': '0x4881A4418b5F2460B21d6F08CD5aA0678a7f262F'
+  };
+  var currentPrice = 0;
+  var feedAddr = chainlinkFeeds[asset];
+  if (feedAddr && walletState.provider) {
+    try {
+      var feedAbi = ['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)'];
+      var feed = new ethers.Contract(feedAddr, feedAbi, walletState.provider);
+      var roundData = await feed.latestRoundData();
+      currentPrice = Number(roundData[1]) / 1e8; // Chainlink uses 8 decimals
+      console.log('Chainlink ' + asset + ' price: $' + currentPrice);
+    } catch (e) {
+      console.warn('Chainlink feed error:', e);
+    }
+  }
+  if (!currentPrice) {
+    currentPrice = (typeof currentAssets !== 'undefined' && currentAssets[asset])
+      ? currentAssets[asset].current_price : 0;
+  }
+  if (!currentPrice || currentPrice <= 0) {
+    showToast('No market price available for ' + asset + '. Try again.', 'error');
+    return;
+  }
+  // openPrice uses 1e10 precision on-chain
+  var openPriceScaled = BigInt(Math.round(currentPrice * 1e10));
+
+  // TP/SL as absolute prices in 1e10 precision
   var tpScaled = 0;
   var slScaled = 0;
+  if (tpPct > 0) {
+    tpScaled = BigInt(Math.round(currentPrice * (1 + tpPct / 100) * 1e10));
+  }
+  if (slPct > 0) {
+    slScaled = BigInt(Math.round(currentPrice * (1 - slPct / 100) * 1e10));
+  }
 
   // Server-side validation (mirrors client-side guards)
   var valResp = await fetch('/api/gtrade/validate-trade', {
@@ -430,10 +471,10 @@ async function executeTrade() {
     // Verified selector: 0x5bfcc4f8 via https://api.openchain.xyz
     var tradeAbi = [
       'function openTrade(' +
-        'tuple(address user, uint32 pairIndex, uint16 index, uint24 leverage, ' +
+        'tuple(address user, uint32 index, uint16 pairIndex, uint24 leverage, ' +
         'bool long, bool isOpen, uint8 collateralIndex, uint8 tradeType, ' +
         'uint120 collateralAmount, uint64 openPrice, uint64 tp, uint64 sl, ' +
-        'bool isCounterTrade, uint160 positionSizeToken, uint24 maxClosingSlippageP) _trade, ' +
+        'bool isCounterTrade, uint160 positionSizeToken, uint24 __placeholder) _trade, ' +
         'uint16 _maxSlippageP, address _referrer)'
     ];
 
@@ -441,30 +482,38 @@ async function executeTrade() {
     var leverageScaled = Math.round(leverage * 1000);
 
     // slippageP uses 1e3 precision: 1% = 1000, 0.5% = 500
-    var slippageInput = parseFloat(document.getElementById('trade-slippage').value) || 1;
+    var slippageInput = parseFloat(document.getElementById('trade-slippage').value) || 1.5;
     var slippageP = Math.round(slippageInput * 1000);
 
     var trade = {
       user: walletState.address,
+      index: 0,                    // trade counter (0 for new trade)
       pairIndex: pairData.pair_index,
-      index: 0,
       leverage: leverageScaled,
       long: direction === 'long',
       isOpen: false,
       collateralIndex: gtradeConfig.collateral_index,
       tradeType: 0,                // 0 = market order
       collateralAmount: collateralAmount,
-      openPrice: 0,                // 0 = market price
+      openPrice: openPriceScaled,   // current market price in 1e10
       tp: tpScaled,
       sl: slScaled,
       isCounterTrade: false,
       positionSizeToken: 0,
-      maxClosingSlippageP: slippageP
+      __placeholder: 0
     };
+
+    console.log('=== gTrade openTrade DEBUG ===');
+    console.log('trade struct:', JSON.stringify(trade, function(k,v) { return typeof v === 'bigint' ? v.toString() : v; }));
+    console.log('maxSlippageP:', slippageP);
+    console.log('collateralIndex:', gtradeConfig.collateral_index);
+    console.log('collateralAmount raw:', collateralAmount.toString());
+    console.log('usdc_decimals:', gtradeConfig.usdc_decimals);
 
     showToast('Opening ' + direction + ' ' + asset + '...', 'info', 15000);
     execBtn.textContent = 'Opening Trade...';
-    var tx = await diamond.openTrade(trade, slippageP, ethers.ZeroAddress);
+
+    var tx = await diamond.openTrade(trade, slippageP, ethers.ZeroAddress, { gasLimit: 3000000 });
     showToast('Transaction submitted. Waiting for confirmation...', 'info', 20000);
     var receipt = await tx.wait();
 
@@ -473,7 +522,8 @@ async function executeTrade() {
       'success', 10000
     );
     await refreshUSDCBalance();
-    loadOpenTrades();
+    // Poll for backend to index the new trade (oracle callback is async)
+    pollOpenTrades(5, 3000);
 
   } catch (e) {
     var msg = e.reason || e.shortMessage || e.message || 'Transaction failed';
@@ -518,6 +568,17 @@ function selectTradeAsset(asset) {
   updateTradePreview();
 }
 
+function pollOpenTrades(attempts, intervalMs) {
+  var count = 0;
+  loadOpenTrades();
+  var timer = setInterval(function() {
+    count++;
+    loadOpenTrades();
+    refreshUSDCBalance();
+    if (count >= attempts) clearInterval(timer);
+  }, intervalMs);
+}
+
 async function loadOpenTrades() {
   if (!walletState.connected) return;
   var container = document.getElementById('open-trades-list');
@@ -550,7 +611,7 @@ async function loadOpenTrades() {
         '<span>' + pairLabel + '</span>' +
         '<span>Entry: $' + openPrice + '</span>' +
         '<span>' + col + ' USDC</span>' +
-        '<button class="close-trade-btn" onclick="closeTrade(' + tradeIdx + ')" title="Close position">✕</button>' +
+        '<button class="close-trade-btn" onclick="closeTrade(' + tradeIdx + ',' + pairIdx + ')" title="Close position">✕</button>' +
         '</div>';
     });
     container.innerHTML = html;
@@ -559,7 +620,7 @@ async function loadOpenTrades() {
   }
 }
 
-async function closeTrade(tradeIndex) {
+async function closeTrade(tradeIndex, pairIndex) {
   if (!walletState.connected || !walletState.signer) {
     showToast('Connect wallet first', 'error');
     return;
@@ -574,10 +635,27 @@ async function closeTrade(tradeIndex) {
   }
   tradePending = true;
   try {
+    // Fetch live Chainlink price for the pair (same as openTrade)
+    var chainlinkByPair = {
+      0: '0x6ce185860a4963106506C203335A2910413708e9',   // BTC
+      1: '0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612',   // ETH
+    };
+    var expectedPrice = BigInt(0);
+    var feedAddr = chainlinkByPair[pairIndex];
+    if (feedAddr && walletState.provider) {
+      try {
+        var feedAbi = ['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)'];
+        var feed = new ethers.Contract(feedAddr, feedAbi, walletState.provider);
+        var roundData = await feed.latestRoundData();
+        // Chainlink 8 decimals → gTrade 10 decimals: multiply by 100
+        expectedPrice = BigInt(roundData[1]) * 100n;
+      } catch (_) {}
+    }
+
     var closeAbi = ['function closeTradeMarket(uint32 _index, uint64 _expectedPrice)'];
     var diamond = new ethers.Contract(gtradeConfig.trading_contract, closeAbi, walletState.signer);
     showToast('Closing position...', 'info', 15000);
-    var tx = await diamond.closeTradeMarket(tradeIndex, 0);
+    var tx = await diamond.closeTradeMarket(tradeIndex, expectedPrice, { gasLimit: 3000000 });
     showToast('Close submitted. Waiting for confirmation...', 'info', 20000);
     var receipt = await tx.wait();
     showToast(
@@ -585,7 +663,8 @@ async function closeTrade(tradeIndex) {
       'success', 10000
     );
     await refreshUSDCBalance();
-    loadOpenTrades();
+    // Poll for backend to index the closed trade
+    pollOpenTrades(5, 3000);
   } catch (e) {
     var msg = e.reason || e.shortMessage || e.message || 'Close trade failed';
     if (e.code === 4001 || (e.info && e.info.error && e.info.error.code === 4001)) {
