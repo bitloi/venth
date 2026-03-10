@@ -393,9 +393,7 @@ async function executeTrade() {
       var feed = new ethers.Contract(feedAddr, feedAbi, walletState.provider);
       var roundData = await feed.latestRoundData();
       currentPrice = Number(roundData[1]) / 1e8; // Chainlink uses 8 decimals
-      console.log('Chainlink ' + asset + ' price: $' + currentPrice);
     } catch (e) {
-      console.warn('Chainlink feed error:', e);
     }
   }
   if (!currentPrice) {
@@ -502,13 +500,6 @@ async function executeTrade() {
       positionSizeToken: 0,
       __placeholder: 0
     };
-
-    console.log('=== gTrade openTrade DEBUG ===');
-    console.log('trade struct:', JSON.stringify(trade, function(k,v) { return typeof v === 'bigint' ? v.toString() : v; }));
-    console.log('maxSlippageP:', slippageP);
-    console.log('collateralIndex:', gtradeConfig.collateral_index);
-    console.log('collateralAmount raw:', collateralAmount.toString());
-    console.log('usdc_decimals:', gtradeConfig.usdc_decimals);
 
     showToast('Opening ' + direction + ' ' + asset + '...', 'info', 15000);
     execBtn.textContent = 'Opening Trade...';
